@@ -2,18 +2,14 @@ name: Build liver (all platforms)
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 env:
   UTHASH_URL: https://raw.githubusercontent.com/troydhanson/uthash/master/src/uthash.h
 
 jobs:
-
-  # ===========================================================================
-  # LINUX: glibc static + musl static
-  # ===========================================================================
   build-linux:
     runs-on: ubuntu-latest
     strategy:
@@ -26,7 +22,7 @@ jobs:
           - name: musl
             target: musl
             artifact: liver-linux-musl
-            verify: false   # musl binary may need Alpine env to run
+            verify: false
 
     steps:
       - name: Checkout code
@@ -47,20 +43,19 @@ jobs:
       - name: Download uthash header
         run: |
           mkdir -p include
-          wget -q -O include/uthash.h ${{ env.UTHASH_URL }}
+          wget -q -O include/uthash.h "${UTHASH_URL}"
 
-      - name: Build ${{ matrix.variant.name }} static binary
+      - name: Build ${{ matrix.variant.name }} binary
         run: |
           make clean
           make ${{ matrix.variant.target }}
 
       - name: Verify ${{ matrix.variant.name }} binary
-        if: ${{ matrix.variant.verify }}
+        if: matrix.variant.verify
         run: |
           chmod +x liver
           file liver
-          echo "Testing binary execution..."
-          ./liver --help || ./liver --version || ./liver || echo "Binary executed (no standard flags)"
+          ./liver --help || ./liver --version || ./liver || echo "Binary executed"
 
       - name: Upload ${{ matrix.variant.name }} artifact
         uses: actions/upload-artifact@v4
@@ -68,14 +63,12 @@ jobs:
           name: ${{ matrix.variant.artifact }}
           path: liver
 
-  # ===========================================================================
-  # WINDOWS: MinGW-w64 static
-  # ===========================================================================
   build-windows:
     runs-on: windows-latest
     defaults:
       run:
         shell: msys2 {0}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -86,7 +79,7 @@ jobs:
           update: true
           install: >-
             mingw-w64-x86_64-gcc
-            make
+            mingw-w64-x86_64-make
             mingw-w64-x86_64-curl
             mingw-w64-x86_64-openssl
             mingw-w64-x86_64-cjson
@@ -95,14 +88,16 @@ jobs:
       - name: Download uthash header
         run: |
           mkdir -p include
-          wget -q -O include/uthash.h ${{ env.UTHASH_URL }}
+          wget -q -O include/uthash.h "${UTHASH_URL}"
 
-      - name: Build Windows static binary
+      - name: Build Windows binary
         run: |
+          make clean
           make windows
 
       - name: Verify Windows binary
         run: |
+          ls -l liver.exe
           file liver.exe || echo "Binary built successfully"
 
       - name: Upload Windows artifact
@@ -111,28 +106,28 @@ jobs:
           name: liver-windows
           path: liver.exe
 
-  # ===========================================================================
-  # MACOS: clang with Homebrew
-  # ===========================================================================
   build-macos:
     runs-on: macos-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies via Homebrew
         run: |
-          brew install curl openssl cjson wget
+          brew update
+          brew install curl openssl@3 cjson wget
 
       - name: Download uthash header
         run: |
           mkdir -p include
-          wget -q -O include/uthash.h ${{ env.UTHASH_URL }}
+          wget -q -O include/uthash.h "${UTHASH_URL}"
 
       - name: Build macOS binary
         run: |
-          export CFLAGS="-I$(brew --prefix openssl)/include -I$(brew --prefix cjson)/include"
-          export LDFLAGS="-L$(brew --prefix openssl)/lib -L$(brew --prefix cjson)/lib"
+          export CFLAGS="-I$(brew --prefix openssl@3)/include -I$(brew --prefix cjson)/include"
+          export LDFLAGS="-L$(brew --prefix openssl@3)/lib -L$(brew --prefix cjson)/lib"
+          make clean
           make macos
 
       - name: Verify macOS binary
