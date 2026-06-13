@@ -4,13 +4,13 @@
  * GT League In‑Play 1X2 Bot (Lowest Odds < 2.0) – Multi‑threaded
  *
  * Requires:
- *   libcurl, cJSON, libuuid, uthash, libssl / libcrypto
+ *   libcurl, cJSON, libuuid, uthash
  *
  * Build (example):
- *   gcc -Wall -O2 -o betway_gt_bot betway_gt_bot.c \
- *       -lcurl -lcjson -luuid -lpthread -lssl -lcrypto
+ *   gcc -Wall -O2 -o liver betway_gt_bot.c \
+ *       -lcurl -lcjson -luuid -lpthread -std=c11
  *
- * Usage: ./betway_gt_bot [--live] [--one-time] [--debug]
+ * Usage: ./liver [--live] [--one-time] [--debug]
  *        --debug   : dry‑run + one‑time + DEBUG logging
  */
 
@@ -27,10 +27,7 @@
 #include <ctype.h>
 #include <signal.h>
 #include <errno.h>
-#include <getopt.h>
-
-/* For EVP_DecodeBlock */
-#include <openssl/evp.h>
+#include <stdatomic.h>   /* for atomic shutdown flag */
 
 /* -------------------------------------------------------------------------- */
 /* Configuration                                                              */
@@ -72,10 +69,10 @@ static int_set_t       *placed_bets          = NULL;
 static int_set_t       *betting_in_progress  = NULL;
 static pthread_mutex_t  progress_lock        = PTHREAD_MUTEX_INITIALIZER;
 
-/* Shutdown */
+/* Shutdown – now atomic for safe background reads */
+static atomic_int       shutdown_flag        = 0;
 static pthread_mutex_t  shutdown_lock        = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t   shutdown_cond        = PTHREAD_COND_INITIALIZER;
-static int              shutdown_flag        = 0;
 
 /* Timer map (event_id -> start of 11‑minute window) */
 typedef struct {
@@ -222,8 +219,8 @@ static char *generate_uuid(void) {
 static cJSON *decode_jwt(const char *token) {
     char *saveptr = NULL;
     char *tok = strdup(token);
-    char *part2 = strtok_r(tok, ".", &saveptr);  /* skip header */
-    part2 = strtok_r(NULL, ".", &saveptr);
+    char *part1 = strtok_r(tok, ".", &saveptr);
+    char *part2 = strtok_r(NULL, ".", &saveptr);
     if (!part2) { free(tok); return NULL; }
 
     /* Add padding if needed */
@@ -241,6 +238,7 @@ static cJSON *decode_jwt(const char *token) {
     }
 
     /* Decode */
+    size_t decoded_len = 0;
     char *decoded = (char *)malloc(len);  /* will be smaller */
     if (!decoded) { free(b64); free(tok); return NULL; }
     int ret = EVP_DecodeBlock((unsigned char *)decoded, (unsigned char *)b64, len + pad);
@@ -395,8 +393,7 @@ static int authenticate(void) {
     cJSON_AddStringToObject(body, "username", USERNAME);
     cJSON_AddStringToObject(body, "password", PASSWORD);
     cJSON_AddStringToObject(body, "countryCode", "NG");
-    /* FIX: cJSON_AddItemToObject expects three args (parent, key, item) */
-    cJSON_AddItemToObject(body, "sessionMetadata", cJSON_CreateObject());
+    cJSON_AddObjectToObject(body, "sessionMetadata", cJSON_CreateObject());
     char *body_str = cJSON_PrintUnformatted(body);
     cJSON_Delete(body);
 
@@ -481,21 +478,20 @@ static int fetch_live_data(const char *token, cJSON **out_raw) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Background fetcher thread                                                  */
+/* Background fetcher thread (uses atomic shutdown flag)                      */
 /* -------------------------------------------------------------------------- */
 static void *background_fetcher(void *arg) {
     (void)arg;
-    while (1) {
-        pthread_mutex_lock(&shutdown_lock);
-        if (shutdown_flag) { pthread_mutex_unlock(&shutdown_lock); break; }
-        pthread_mutex_unlock(&shutdown_lock);
-
+    while (!atomic_load(&shutdown_flag)) {
         char *token = NULL;
         pthread_mutex_lock(&auth_lock);
-        while (!token_ready && !shutdown_flag) {
+        while (!token_ready && !atomic_load(&shutdown_flag)) {
             pthread_cond_wait(&token_updated_cond, &auth_lock);
         }
-        if (shutdown_flag) { pthread_mutex_unlock(&auth_lock); break; }
+        if (atomic_load(&shutdown_flag)) {
+            pthread_mutex_unlock(&auth_lock);
+            break;
+        }
         token = strdup(auth_token);
         pthread_mutex_unlock(&auth_lock);
 
@@ -506,7 +502,7 @@ static void *background_fetcher(void *arg) {
             if (latest_raw_json) cJSON_Delete(latest_raw_json);
             latest_raw_json = raw;
             pthread_mutex_unlock(&data_lock);
-            usleep(500000);
+            nanosleep(&(struct timespec){0, 500000000}, NULL); /* 0.5s */
         } else if (rc == 401) {
             LOG_WARN("Fetcher got 401 – re‑authenticating…");
             authenticate();
@@ -520,10 +516,9 @@ static void *background_fetcher(void *arg) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Build selection                                                            */
+/* Build selection (FIXED: detach children from temporary maps before delete) */
 /* -------------------------------------------------------------------------- */
 static cJSON *build_selection(cJSON *raw, int event_id, const char *pick) {
-    /* Build maps from raw arrays */
     cJSON *events = cJSON_GetObjectItem(raw, "events");
     cJSON *prices = cJSON_GetObjectItem(raw, "prices");
     cJSON *markets = cJSON_GetObjectItem(raw, "markets");
@@ -547,7 +542,7 @@ static cJSON *build_selection(cJSON *raw, int event_id, const char *pick) {
     cJSON *p = NULL;
     cJSON_ArrayForEach(p, prices) {
         cJSON *oid = cJSON_GetObjectItem(p, "outcomeId");
-        if (oid) cJSON_AddItemToObject(price_map, oid->valuestring, p); /* ref kept, must not delete */
+        if (oid) cJSON_AddItemToObject(price_map, oid->valuestring, p); /* ref from live copy */
     }
 
     /* Index outcomes by marketId */
@@ -560,7 +555,7 @@ static cJSON *build_selection(cJSON *raw, int event_id, const char *pick) {
             snprintf(key, sizeof(key), "%d", mid->valueint);
             cJSON *arr = cJSON_GetObjectItem(outcomes_by_market, key);
             if (!arr) { arr = cJSON_CreateArray(); cJSON_AddItemToObject(outcomes_by_market, key, arr); }
-            cJSON_AddItemToArray(arr, o);
+            cJSON_AddItemToArray(arr, o); /* ref from live copy */
         }
     }
 
@@ -610,7 +605,26 @@ static cJSON *build_selection(cJSON *raw, int event_id, const char *pick) {
             goto done;
         }
     }
+
 done:
+    /* DETACH all children from temporary containers BEFORE deleting them.
+       This prevents double‑free of items that belong to the live JSON copy. */
+    {
+        cJSON *child = price_map->child;
+        while (child) {
+            cJSON *next = child->next;
+            cJSON_DetachItemFromObject(price_map, child->string);
+            child = next;
+        }
+    }
+    {
+        cJSON *child = outcomes_by_market->child;
+        while (child) {
+            cJSON *next = child->next;
+            cJSON_DetachItemFromObject(outcomes_by_market, child->string);
+            child = next;
+        }
+    }
     cJSON_Delete(price_map);
     cJSON_Delete(outcomes_by_market);
     return result;
@@ -670,7 +684,7 @@ static cJSON *build_bet_payload(cJSON *selection, int wager_amount) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Lowest odds pick                                                           */
+/* Lowest odds pick (FIXED: detach children before delete)                    */
 /* -------------------------------------------------------------------------- */
 static int lowest_odds_pick(cJSON *raw, cJSON *event, char **pick, double *odds) {
     int eid = cJSON_GetObjectItem(event, "eventId")->valueint;
@@ -682,15 +696,16 @@ static int lowest_odds_pick(cJSON *raw, cJSON *event, char **pick, double *odds)
     cJSON *outcomes = cJSON_GetObjectItem(raw, "outcomes");
     if (!prices || !markets || !outcomes) return 0;
 
-    /* Map outcomeId -> priceDecimal */
+    /* Map outcomeId -> priceDecimal (numbers, safe to free) */
     cJSON *price_map = cJSON_CreateObject();
     cJSON *p = NULL;
     cJSON_ArrayForEach(p, prices) {
         cJSON *oid = cJSON_GetObjectItem(p, "outcomeId");
-        if (oid) cJSON_AddNumberToObject(price_map, oid->valuestring, cJSON_GetObjectItem(p, "priceDecimal")->valuedouble);
+        if (oid) cJSON_AddNumberToObject(price_map, oid->valuestring,
+                                         cJSON_GetObjectItem(p, "priceDecimal")->valuedouble);
     }
 
-    /* Map marketId -> outcomes */
+    /* Map marketId -> outcomes (holds references from live copy) */
     cJSON *outcomes_by_market = cJSON_CreateObject();
     cJSON *o = NULL;
     cJSON_ArrayForEach(o, outcomes) {
@@ -700,7 +715,7 @@ static int lowest_odds_pick(cJSON *raw, cJSON *event, char **pick, double *odds)
             snprintf(key, sizeof(key), "%d", mid->valueint);
             cJSON *arr = cJSON_GetObjectItem(outcomes_by_market, key);
             if (!arr) { arr = cJSON_CreateArray(); cJSON_AddItemToObject(outcomes_by_market, key, arr); }
-            cJSON_AddItemToArray(arr, o);
+            cJSON_AddItemToArray(arr, o); /* ref from live copy */
         }
     }
 
@@ -728,8 +743,19 @@ static int lowest_odds_pick(cJSON *raw, cJSON *event, char **pick, double *odds)
         }
     }
 
-    cJSON_Delete(price_map);
+    /* DETACH children before deleting the temporary map (prevents double‑free) */
+    {
+        cJSON *child = outcomes_by_market->child;
+        while (child) {
+            cJSON *next = child->next;
+            cJSON_DetachItemFromObject(outcomes_by_market, child->string);
+            child = next;
+        }
+    }
     cJSON_Delete(outcomes_by_market);
+
+    /* price_map only contains numbers, no references – safe to delete directly */
+    cJSON_Delete(price_map);
 
     /* Find the minimum */
     struct { const char *pick; double odd; } picks[] = {
@@ -851,11 +877,7 @@ static void *bet_match_worker(void *arg) {
     char *current_pick = NULL;
     LOG_INFO("Thread for match %d (%s) started", event_id, match_name);
 
-    while (retries <= MAX_RETRIES) {
-        pthread_mutex_lock(&shutdown_lock);
-        if (shutdown_flag) { pthread_mutex_unlock(&shutdown_lock); break; }
-        pthread_mutex_unlock(&shutdown_lock);
-
+    while (retries <= MAX_RETRIES && !atomic_load(&shutdown_flag)) {
         /* 1. Freshest data */
         cJSON *raw_bet = NULL;
         pthread_mutex_lock(&data_lock);
@@ -863,7 +885,7 @@ static void *bet_match_worker(void *arg) {
         pthread_mutex_unlock(&data_lock);
         if (!raw_bet) {
             retries++;
-            sleep(1);
+            nanosleep(&(struct timespec){1, 0}, NULL);
             continue;
         }
 
@@ -941,7 +963,6 @@ static void *bet_match_worker(void *arg) {
         cJSON_Delete(payload);
 
         if (success) {
-            /* Log success details */
             if (resp_data) {
                 cJSON *bet_resps = cJSON_GetObjectItem(resp_data, "betResponses");
                 if (bet_resps && cJSON_GetArraySize(bet_resps) > 0) {
@@ -959,7 +980,7 @@ static void *bet_match_worker(void *arg) {
             }
             if (ONE_TIME) {
                 LOG_INFO("ONE_TIME set – requesting bot shutdown");
-                shutdown_flag = 1;
+                atomic_store(&shutdown_flag, 1);
                 pthread_cond_broadcast(&shutdown_cond);
             }
             if (resp_data) cJSON_Delete(resp_data);
@@ -992,7 +1013,6 @@ static void *bet_match_worker(void *arg) {
     free(current_pick);
     free(match_name);
 
-    /* Clean up progress sets */
     pthread_mutex_lock(&progress_lock);
     set_remove(&betting_in_progress, event_id);
     set_add(&placed_bets, event_id);
@@ -1006,7 +1026,7 @@ static void *bet_match_worker(void *arg) {
 /* -------------------------------------------------------------------------- */
 static void sigint_handler(int sig) {
     (void)sig;
-    shutdown_flag = 1;
+    atomic_store(&shutdown_flag, 1);
     pthread_cond_broadcast(&shutdown_cond);
 }
 
@@ -1015,13 +1035,6 @@ static void sigint_handler(int sig) {
 /* -------------------------------------------------------------------------- */
 int main(int argc, char **argv) {
     /* Parse command-line */
-    int opt;
-    while ((opt = getopt(argc, argv, "h")) != -1) {
-        if (opt == 'h') {
-            printf("Usage: %s [--live] [--one-time] [--debug] --username [USERNAME] --password [PASSWORD]\n", argv[0]);
-            return 0;
-        }
-    }
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--live") == 0) IS_LIVE = 1;
         else if (strcmp(argv[i], "--one-time") == 0) ONE_TIME = 1;
@@ -1051,20 +1064,16 @@ int main(int argc, char **argv) {
     pthread_t fetcher_tid;
     pthread_create(&fetcher_tid, NULL, background_fetcher, NULL);
 
-    /* Timer map (event_id -> time) */
+    /* Timer map */
     timer_map = NULL;
 
-    while (1) {
-        pthread_mutex_lock(&shutdown_lock);
-        if (shutdown_flag) { pthread_mutex_unlock(&shutdown_lock); break; }
-        pthread_mutex_unlock(&shutdown_lock);
-
+    while (!atomic_load(&shutdown_flag)) {
         /* Get a copy of latest raw data */
         cJSON *raw = NULL;
         pthread_mutex_lock(&data_lock);
         if (latest_raw_json) raw = cJSON_Duplicate(latest_raw_json, 1);
         pthread_mutex_unlock(&data_lock);
-        if (!raw) { usleep(500000); continue; }
+        if (!raw) { nanosleep(&(struct timespec){0, 500000000}, NULL); continue; }
 
         /* Find GT League active events */
         cJSON *gt_events = cJSON_CreateArray();
@@ -1091,11 +1100,10 @@ int main(int argc, char **argv) {
                 cJSON *gs = cJSON_GetObjectItem(ev, "gameStateTimeScore");
                 int h, a;
                 get_score(gs, &h, &a);
-                LOG_INFO("  %s vs %s  (%s, elapsed: %.0f min)",
+                LOG_INFO("  %s vs %s  (%d-%d, elapsed: %.0f min)",
                          cJSON_GetObjectItem(ev, "homeTeam")->valuestring,
                          cJSON_GetObjectItem(ev, "awayTeam")->valuestring,
-                         (h>=0 ? "X-X" : "?-?"), /* simplified */
-                         gs ? cJSON_GetObjectItem(gs, "time")->valuedouble : -1.0);
+                         h, a, gs ? cJSON_GetObjectItem(gs, "time")->valuedouble : -1.0);
             }
         }
 
@@ -1104,7 +1112,6 @@ int main(int argc, char **argv) {
         cJSON_ArrayForEach(ev, gt_events) {
             int eid = cJSON_GetObjectItem(ev, "eventId")->valueint;
 
-            /* Dual‑bet prevention */
             pthread_mutex_lock(&progress_lock);
             if (set_contains(&placed_bets, eid) || set_contains(&betting_in_progress, eid)) {
                 pthread_mutex_unlock(&progress_lock);
@@ -1131,7 +1138,6 @@ int main(int argc, char **argv) {
             timer_entry_t *timer = NULL;
             HASH_FIND_INT(timer_map, &eid, timer);
             if (!timer) {
-                /* first time in 11+ min */
                 timer_entry_t *entry = malloc(sizeof(timer_entry_t));
                 entry->event_id = eid;
                 entry->start_time = time(NULL);
@@ -1144,7 +1150,6 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            /* Already in window, check timer expiry */
             time_t now = time(NULL);
             if (now - timer->start_time < TIMER_SECONDS) {
                 LOG_INFO("Match %d (%s) – waiting in 11 min window (%ld/%ds)",
@@ -1155,13 +1160,11 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            /* Timer expired – launch bet thread */
             LOG_INFO("Match %d (%s) – %ds timer expired, launching bet thread",
                      eid, match_name, TIMER_SECONDS);
             HASH_DEL(timer_map, timer);
             free(timer);
 
-            /* Re‑check odds */
             char *pick = NULL;
             double odds = 0;
             if (!lowest_odds_pick(raw, ev, &pick, &odds) || odds >= 2.0) {
@@ -1177,27 +1180,24 @@ int main(int argc, char **argv) {
 
             LOG_INFO("Bet candidate: %s – %s @ %.2f", match_name, pick, odds);
 
-            /* Launch bet thread */
             bet_args_t *args = malloc(sizeof(bet_args_t));
             args->event_id = eid;
             args->match_name = strdup(match_name);
             pthread_t tid;
             pthread_create(&tid, NULL, bet_match_worker, args);
-            pthread_detach(tid);  /* we don't need to join now */
+            pthread_detach(tid);
             free(pick);
         }
 
         cJSON_Delete(gt_events);
         cJSON_Delete(raw);
-        usleep(500000);
+        nanosleep(&(struct timespec){0, 500000000}, NULL);
     }
 
-    /* Shutdown */
     LOG_INFO("Bot shutdown requested. Waiting for active bet threads to finish...");
     pthread_cancel(fetcher_tid);
     pthread_join(fetcher_tid, NULL);
 
-    /* Clean up */
     if (latest_raw_json) cJSON_Delete(latest_raw_json);
     curl_global_cleanup();
     LOG_INFO("Bot stopped cleanly.");
