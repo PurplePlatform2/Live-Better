@@ -31,7 +31,7 @@ ifeq ($(PLATFORM),linux)
   TARGET_FILE ?= $(TARGET)
   CFLAGS      += -pipe
   ifneq ($(STATIC),0)
-    LDFLAGS   += -static -s
+    LDFLAGS   += #-static -s
   endif
   LDFLAGS     += -lcurl -lcjson -lssl -lcrypto -luuid -lpthread
 endif
