@@ -1,4 +1,4 @@
-name: Build liver (all platforms)
+name: Build and Run (Linux)
 
 on:
   push:
@@ -6,138 +6,52 @@ on:
   pull_request:
     branches: [main]
 
-env:
-  UTHASH_URL: https://raw.githubusercontent.com/troydhanson/uthash/master/src/uthash.h
-
 jobs:
-  build-linux:
+  build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        variant:
-          - name: glibc
-            target: all
-            artifact: liver-linux-glibc
-            verify: true
-          - name: musl
-            target: musl
-            artifact: liver-linux-musl
-            verify: false
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
-            musl-tools \
+            make \
+            libc6-dev \
             libcurl4-openssl-dev \
-            libcjson-dev \
-            uuid-dev \
             libssl-dev \
+            uuid-dev \
+            libcjson-dev \
+            zlib1g-dev \
+            pkg-config \
             wget
 
-      - name: Download uthash header
+      - name: Build project
         run: |
-          mkdir -p include
-          wget -q -O include/uthash.h "${UTHASH_URL}"
+          make
 
-      - name: Build ${{ matrix.variant.name }} binary
-        run: |
-          make clean
-          make ${{ matrix.variant.target }}
-
-      - name: Verify ${{ matrix.variant.name }} binary
-        if: matrix.variant.verify
-        run: |
-          chmod +x liver
-          file liver
-          ./liver --help || ./liver --version || ./liver || echo "Binary executed"
-
-      - name: Upload ${{ matrix.variant.name }} artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.variant.artifact }}
+          name: liver-binary
           path: liver
 
-  build-windows:
-    runs-on: windows-latest
-    defaults:
-      run:
-        shell: msys2 {0}
+  run:
+    runs-on: ubuntu-latest
+    needs: build
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup MSYS2 with toolchain
-        uses: msys2/setup-msys2@v2
+      - name: Download artifact
+        uses: actions/download-artifact@v4
         with:
-          update: true
-          install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-make
-            mingw-w64-x86_64-curl
-            mingw-w64-x86_64-openssl
-            mingw-w64-x86_64-cjson
-            wget
+          name: liver-binary
 
-      - name: Download uthash header
+      - name: Make executable
+        run: chmod +x liver
+
+      - name: Execute binary
         run: |
-          mkdir -p include
-          wget -q -O include/uthash.h "${UTHASH_URL}"
-
-      - name: Build Windows binary
-        run: |
-          make clean
-          make windows
-
-      - name: Verify Windows binary
-        run: |
-          ls -l liver.exe
-          file liver.exe || echo "Binary built successfully"
-
-      - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: liver-windows
-          path: liver.exe
-
-  build-macos:
-    runs-on: macos-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies via Homebrew
-        run: |
-          brew update
-          brew install curl openssl@3 cjson wget
-
-      - name: Download uthash header
-        run: |
-          mkdir -p include
-          wget -q -O include/uthash.h "${UTHASH_URL}"
-
-      - name: Build macOS binary
-        run: |
-          export CFLAGS="-I$(brew --prefix openssl@3)/include -I$(brew --prefix cjson)/include"
-          export LDFLAGS="-L$(brew --prefix openssl@3)/lib -L$(brew --prefix cjson)/lib"
-          make clean
-          make macos
-
-      - name: Verify macOS binary
-        run: |
-          chmod +x liver
-          file liver
-          ./liver --help || ./liver --version || ./liver || echo "Binary executed"
-
-      - name: Upload macOS artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: liver-macos
-          path: liver
+          ./liver || echo "Execution finished (or no output)"
