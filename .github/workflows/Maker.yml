@@ -1,37 +1,41 @@
-name: C/C++ CI
+name: Build liver
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ main ]
 
 jobs:
-  build:
-
+  build-linux:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libcurl4-openssl-dev libcjson-dev uuid-dev libssl-dev
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libcurl4-openssl-dev \
+            libcjson-dev \
+            uuid-dev \
+            libssl-dev \
+            wget
 
-    - name: Download uthash (header‑only library)
-      run: |
-        mkdir -p include
-        wget -q -O include/uthash.h \
-          "https://raw.githubusercontent.com/troydhanson/uthash/master/src/uthash.h"
+      - name: Download uthash
+        run: |
+          mkdir -p include
+          wget -q -O include/uthash.h \
+            "https://raw.githubusercontent.com/troydhanson/uthash/master/src/uthash.h"
 
-    - name: Build
-      run: make
+      - name: Compile (Linux)
+        run: make linux
 
-    - name: Export binary
-      uses: actions/upload-artifact@v4
-      with:
-        name: liver
-        path: liver
-        retention-days: 5
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: liver-linux
+          path: liver
