@@ -14,7 +14,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -30,14 +35,14 @@ jobs:
             wget
 
       - name: Build project
-        run: |
-          make
+        run: make
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: liver-binary
           path: liver
+
 
   run:
     runs-on: ubuntu-latest
@@ -49,7 +54,12 @@ jobs:
         with:
           name: liver-binary
 
-      - name: Install dependencies
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -66,6 +76,9 @@ jobs:
 
       - name: Make executable
         run: chmod +x liver
+
+      - name: Verify Node is available
+        run: node -v
 
       - name: Execute binary
         run: |
