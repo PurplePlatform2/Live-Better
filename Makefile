@@ -1,117 +1,203 @@
+============================================================================
+sanBot Build System
 
-# ============================================================================
-# sanBot Makefile
-# Builds:
-#   Linux   -> liver
-#   Windows -> liver.exe
-# ============================================================================
 
-# ---------------------------------------------------------------------------
-# Target selection
-#
-# Examples:
-#   make
-#   make TARGET_OS=windows
-# ---------------------------------------------------------------------------
-TARGET_OS ?= linux
+Targets:
+make -> Native platform build
+make linux -> Linux build
+make windows -> Windows build (.exe)
+make macos -> macOS build
 
-# ---------------------------------------------------------------------------
-# Compiler setup
-# ---------------------------------------------------------------------------
-ifeq ($(TARGET_OS),windows)
 
-CC       = x86_64-w64-mingw32-gcc
-TARGET   = liver.exe
+Author: Sanne Karibo
+============================================================================
 
-CFLAGS   = -Wall -O2 -Iinclude
+TARGET := liver
+SRC := live.c
 
-LDFLAGS  = \
-	-static \
-	-lcurl \
-	-lssl \
-	-lcrypto \
-	-lws2_32 \
-	-lcrypt32 \
-	-lbcrypt
+UNAME_S := $(shell uname -s)
+
+============================================================================
+Platform Detection
+============================================================================
+
+ifeq ($(OS),Windows_NT)
+
+PLATFORM = windows
+
+else ifeq ($(UNAME_S),Linux)
+
+PLATFORM = linux
+
+else ifeq ($(UNAME_S),Darwin)
+
+PLATFORM = macos
 
 else
 
-CC       = gcc
-TARGET   = liver
-
-CFLAGS   = \
-	-Wall \
-	-O2 \
-	-pthread \
-	$(shell pkg-config --cflags libcurl libcjson 2>/dev/null) \
-	-Iinclude
-
-LDFLAGS  = \
-	$(shell pkg-config --libs libcurl libcjson 2>/dev/null) \
-	-lssl \
-	-lcrypto \
-	-luuid \
-	-lpthread
+$(error Unsupported platform)
 
 endif
 
-SRC = live.c
+============================================================================
+Linux (musl static)
+============================================================================
 
-# ---------------------------------------------------------------------------
-# Targets
-# ---------------------------------------------------------------------------
-.PHONY: all clean install-deps install-mingw uthash linux windows
+ifeq ($(PLATFORM),linux)
 
-all: $(TARGET)
+CC = musl-gcc
+
+TARGET_FILE = $(TARGET)
+
+CFLAGS = \
+    -O3 \
+    -pipe \
+    -Wall \
+    -Wextra \
+    -Iinclude
+
+LDFLAGS = \
+    -static \
+    -s \
+    -lcurl \
+    -lcjson \
+    -lssl \
+    -lcrypto \
+    -luuid \
+    -lpthread
+
+endif
+
+============================================================================
+Windows (MinGW)
+============================================================================
+
+ifeq ($(PLATFORM),windows)
+
+CC = x86_64-w64-mingw32-gcc
+
+TARGET_FILE = $(TARGET).exe
+
+CFLAGS = \
+    -O3 \
+    -Wall \
+    -Wextra \
+    -Iinclude
+
+LDFLAGS = \
+    -static \
+    -s \
+    -lcurl \
+    -lcjson \
+    -lssl \
+    -lcrypto \
+    -lws2_32 \
+    -lcrypt32 \
+    -lbcrypt
+
+endif
+
+============================================================================
+macOS
+============================================================================
+
+ifeq ($(PLATFORM),macos)
+
+CC = clang
+
+TARGET_FILE = $(TARGET)
+
+CFLAGS = \
+    -O3 \
+    -Wall \
+    -Wextra \
+    -Iinclude
+
+LDFLAGS = \
+    -lcurl \
+    -lcjson \
+    -lssl \
+    -lcrypto
+
+endif
+
+============================================================================
+Build Rules
+============================================================================
+
+.PHONY: all linux windows macos clean verify install-deps uthash
+
+all: $(TARGET_FILE)
+
+$(TARGET_FILE): $(SRC) include/uthash.h
+@echo "Building $(TARGET_FILE) for $(PLATFORM)..."
+$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+============================================================================
+Explicit Builds
+============================================================================
 
 linux:
-	$(MAKE) TARGET_OS=linux
+$(MAKE) PLATFORM=linux
 
 windows:
-	$(MAKE) TARGET_OS=windows
+$(MAKE) PLATFORM=windows OS=Windows_NT
 
-$(TARGET): $(SRC) include/uthash.h
-	@echo "Building $(TARGET)..."
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+macos:
+$(MAKE) PLATFORM=macos
 
-# ---------------------------------------------------------------------------
-# Linux dependencies
-# ---------------------------------------------------------------------------
+============================================================================
+Verify Binary
+============================================================================
+
+verify:
+@echo
+@echo "Binary information:"
+file $(TARGET_FILE)
+@echo
+@echo "Dependencies:"
+-ldd $(TARGET_FILE)
+@echo
+
+============================================================================
+Dependencies
+============================================================================
+
 install-deps:
-	sudo apt-get update
-	sudo apt-get install -y \
-		build-essential \
-		libcurl4-openssl-dev \
-		libcjson-dev \
-		uuid-dev \
-		libssl-dev \
-		wget
-	$(MAKE) uthash
+ifeq ($(PLATFORM),linux)
+sudo apt update
+sudo apt install -y
+build-essential
+musl-tools
+libcurl4-openssl-dev
+libcjson-dev
+libssl-dev
+uuid-dev
+wget
+endif
 
-# ---------------------------------------------------------------------------
-# Windows cross compiler
-# ---------------------------------------------------------------------------
-install-mingw:
-	sudo apt-get update
-	sudo apt-get install -y \
-		mingw-w64 \
-		gcc-mingw-w64-x86-64
+ifeq ($(PLATFORM),macos)
+brew install curl openssl cjson wget
+endif
 
-# ---------------------------------------------------------------------------
-# uthash
-# ---------------------------------------------------------------------------
+$(MAKE) uthash
+============================================================================
+uthash
+============================================================================
+
 uthash: include/uthash.h
 
 include/uthash.h:
-	@echo "Downloading uthash..."
-	mkdir -p include
-	wget -q -O include/uthash.h \
-	"https://raw.githubusercontent.com/troydhanson/uthash/master/src/uthash.h"
-	@echo "uthash installed."
+@echo "Downloading uthash..."
+mkdir -p include
+wget -q -O include/uthash.h
+https://raw.githubusercontent.com/troydhanson/uthash/master/src/uthash.h
+@echo "uthash installed."
 
-# ---------------------------------------------------------------------------
-# Cleanup
-# ---------------------------------------------------------------------------
+============================================================================
+Cleanup
+============================================================================
+
 clean:
-	rm -f liver liver.exe *.o
-	rm -rf include
+rm -f liver liver.exe *.o
+rm -rf include
