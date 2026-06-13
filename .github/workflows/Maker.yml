@@ -33,7 +33,7 @@ jobs:
             https://raw.githubusercontent.com/troydhanson/uthash/master/src/uthash.h
 
       - name: Build Linux binary
-        run: make linux
+        run: sudo make musl
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
@@ -55,7 +55,7 @@ jobs:
           update: true
           install: >
             mingw-w64-x86_64-gcc
-            make
+            make 
             mingw-w64-x86_64-curl
             mingw-w64-x86_64-openssl
 
