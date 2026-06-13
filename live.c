@@ -4,11 +4,11 @@
  * GT League In‑Play 1X2 Bot (Lowest Odds < 2.0) – Multi‑threaded
  *
  * Requires:
- *   libcurl, cJSON, libuuid, uthash
+ *   libcurl, cJSON, libuuid, uthash, libssl / libcrypto
  *
  * Build (example):
  *   gcc -Wall -O2 -o betway_gt_bot betway_gt_bot.c \
- *       -lcurl -lcjson -luuid -lpthread
+ *       -lcurl -lcjson -luuid -lpthread -lssl -lcrypto
  *
  * Usage: ./betway_gt_bot [--live] [--one-time] [--debug]
  *        --debug   : dry‑run + one‑time + DEBUG logging
@@ -28,6 +28,9 @@
 #include <signal.h>
 #include <errno.h>
 #include <getopt.h>
+
+/* For EVP_DecodeBlock */
+#include <openssl/evp.h>
 
 /* -------------------------------------------------------------------------- */
 /* Configuration                                                              */
@@ -219,8 +222,8 @@ static char *generate_uuid(void) {
 static cJSON *decode_jwt(const char *token) {
     char *saveptr = NULL;
     char *tok = strdup(token);
-    char *part1 = strtok_r(tok, ".", &saveptr);
-    char *part2 = strtok_r(NULL, ".", &saveptr);
+    char *part2 = strtok_r(tok, ".", &saveptr);  /* skip header */
+    part2 = strtok_r(NULL, ".", &saveptr);
     if (!part2) { free(tok); return NULL; }
 
     /* Add padding if needed */
@@ -238,7 +241,6 @@ static cJSON *decode_jwt(const char *token) {
     }
 
     /* Decode */
-    size_t decoded_len = 0;
     char *decoded = (char *)malloc(len);  /* will be smaller */
     if (!decoded) { free(b64); free(tok); return NULL; }
     int ret = EVP_DecodeBlock((unsigned char *)decoded, (unsigned char *)b64, len + pad);
@@ -393,7 +395,8 @@ static int authenticate(void) {
     cJSON_AddStringToObject(body, "username", USERNAME);
     cJSON_AddStringToObject(body, "password", PASSWORD);
     cJSON_AddStringToObject(body, "countryCode", "NG");
-    cJSON_AddObjectToObject(body, "sessionMetadata", cJSON_CreateObject());
+    /* FIX: cJSON_AddItemToObject expects three args (parent, key, item) */
+    cJSON_AddItemToObject(body, "sessionMetadata", cJSON_CreateObject());
     char *body_str = cJSON_PrintUnformatted(body);
     cJSON_Delete(body);
 
