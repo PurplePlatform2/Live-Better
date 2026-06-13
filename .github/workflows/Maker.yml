@@ -14,11 +14,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install dependencies (Linux)
         run: |
-          sudo apt-get update && apt install -y musl-tools
+          sudo apt-get update
           sudo apt-get install -y \
             build-essential \
+            musl-tools \
             libcurl4-openssl-dev \
             libcjson-dev \
             uuid-dev \
@@ -29,13 +30,48 @@ jobs:
         run: |
           mkdir -p include
           wget -q -O include/uthash.h \
-            "https://raw.githubusercontent.com/troydhanson/uthash/master/src/uthash.h"
+            https://raw.githubusercontent.com/troydhanson/uthash/master/src/uthash.h
 
-      - name: Compile (Linux)
+      - name: Build Linux binary
         run: make linux
 
-      - name: Upload artifact
+      - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
           name: liver-linux
           path: liver
+
+
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 (MinGW toolchain)
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          install: >
+            mingw-w64-x86_64-gcc
+            make
+            mingw-w64-x86_64-curl
+            mingw-w64-x86_64-openssl
+
+      - name: Download uthash
+        shell: msys2 {0}
+        run: |
+          mkdir -p include
+          curl -L -o include/uthash.h \
+            https://raw.githubusercontent.com/troydhanson/uthash/master/src/uthash.h
+
+      - name: Build Windows binary
+        shell: msys2 {0}
+        run: make windows
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: liver-windows
+          path: liver.exe
