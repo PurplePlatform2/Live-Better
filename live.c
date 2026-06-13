@@ -1,8 +1,9 @@
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 int main(int argc, char *argv[]) {
-    /* Pass credentials to the Node.js script via environment variables */
+    /* ---- pass credentials to the Node.js process via environment variables ---- */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-username") == 0 && i + 1 < argc) {
             setenv("BETWAY_USERNAME", argv[++i], 1);
@@ -11,8 +12,15 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    system(
-        "node -e \""
+    /* ---- launch node, piping the script directly to its stdin ---- */
+    FILE *node_pipe = popen("node", "w");
+    if (!node_pipe) {
+        fprintf(stderr, "Failed to start node. Is it installed?\n");
+        return 1;
+    }
+
+    /* ---- the complete bot script (identical to the standalone version) ---- */
+    const char *script =
         "const axios = require('axios');\n"
         "const crypto = require('crypto');\n"
         "\n"
@@ -651,7 +659,13 @@ int main(int argc, char *argv[]) {
         "main().catch(err => {\n"
         "  log.critical(`Fatal error:\\n${err.stack || err}`);\n"
         "  process.exit(1);\n"
-        "});\n"
-    "\"");
+        "});\n";
+
+    fputs(script, node_pipe);
+    int status = pclose(node_pipe);
+    if (status != 0) {
+        fprintf(stderr, "Node.js script exited with error code %d\n", status);
+        return status;
+    }
     return 0;
 }
