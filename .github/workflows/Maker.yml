@@ -33,7 +33,7 @@ jobs:
             https://raw.githubusercontent.com/troydhanson/uthash/master/src/uthash.h
 
       - name: Build Linux binary
-        run: sudo make musl
+        run:  make 
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
