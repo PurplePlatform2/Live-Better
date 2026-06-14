@@ -21,4 +21,4 @@ jobs:
           python-version: "3.12"
 
       - name: Run live.py
-        run: python live.py
+        run: pip install requests && python live.py
