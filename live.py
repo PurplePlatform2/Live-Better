@@ -237,7 +237,7 @@ def fetch_live_data(token: str) -> Optional[Dict[str, Any]]:
         "countryCode": "NG",
         "sportId": "soccer",
         "Skip": 0,
-        "Take": 100,
+        "Take": 10000,
         "cultureCode": "en-US",
         "isEsport": False,
         "boostedOnly": False,
