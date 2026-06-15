@@ -183,5 +183,5 @@ def process():
 
 # ---------------- RUN ----------------
 if __name__ == "__main__":
-    authenticate()
+    #authenticate()
     process()
