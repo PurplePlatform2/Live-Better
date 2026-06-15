@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Betway GT League Bot – In‑Play 1X2 (Goal Difference / Draw after Delay)
-- Loads token from environment (BETWAY_TOKEN / BETWAY_BRAND) if available,
-  otherwise authenticates and saves them as env vars.
-- Places a bet on the winning team if elapsed >= 11 min and goal diff >= 2.
-- Places a bet on the draw if elapsed >= 11 min + EXTRA_SECONDS and the score is a draw.
+- Loads authentication from a local file (auth.txt). If missing or invalid,
+  performs a fresh login and saves the token to auth.txt.
+- Places a bet on the winning team when elapsed >= 11 min and goal diff >= 2.
+- Places a bet on the draw when elapsed >= 11 min + EXTRA_SECONDS and the score is still level.
 - Retries on transient errors, prevents duplicate bets.
 """
 
@@ -82,6 +82,9 @@ shutdown_event = threading.Event()
 draw_timers: Dict[int, float] = {}
 timer_lock = threading.Lock()
 
+# Local auth file
+AUTH_FILE = "auth.txt"
+
 # ------------------------------------------------------------------------------
 # Utilities
 # ------------------------------------------------------------------------------
@@ -110,9 +113,6 @@ def get_score(game_state: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]
     return None, None
 
 def _is_hidden_error(error_text: str, data_obj: Optional[Dict[str, Any]] = None) -> bool:
-    """
-    Determine if the error is transient (price/version change) and can be retried.
-    """
     triggers = ["price", "version", "changed", "expired", "no longer available",
                 "selection not found", "market suspended", "outcome changed"]
     if any(t in error_text.lower() for t in triggers):
@@ -161,25 +161,45 @@ def parse_bet_response(data_obj: Dict[str, Any]) -> Tuple[bool, bool, Optional[s
     return (True, False, None) if success else (False, hidden, "; ".join(error_messages))
 
 # ------------------------------------------------------------------------------
-# Authentication with environment fallback
+# Authentication – load from auth.txt, fallback to API login and save
 # ------------------------------------------------------------------------------
-def authenticate() -> Tuple[str, str]:
-    # 1. Try environment
-    env_token = os.environ.get("BETWAY_TOKEN")
-    env_brand = os.environ.get("BETWAY_BRAND")
-    if env_token and env_brand:
-        # quick sanity check
-        claims = decode_jwt(env_token)
-        if claims:   # token is parseable, assume valid until proven otherwise
-            log.info("Using token from environment.")
-            with auth_lock:
-                global auth_token, brand_id
-                auth_token = env_token
-                brand_id = env_brand
-                token_updated.set()
-            return env_token, env_brand
+def _save_auth(token: str, brand: str) -> None:
+    try:
+        with open(AUTH_FILE, "w") as f:
+            json.dump({"token": token, "brand": brand}, f)
+        log.info("Authentication saved to %s", AUTH_FILE)
+    except Exception as e:
+        log.warning("Could not save auth file: %s", e)
 
-    # 2. Authenticate via API
+def _load_auth() -> Optional[Tuple[str, str]]:
+    if not os.path.exists(AUTH_FILE):
+        return None
+    try:
+        with open(AUTH_FILE, "r") as f:
+            data = json.load(f)
+        token = data.get("token")
+        brand = data.get("brand")
+        if token and brand and decode_jwt(token):  # quick sanity check
+            return token, brand
+    except Exception:
+        pass
+    return None
+
+def authenticate() -> Tuple[str, str]:
+    global auth_token, brand_id
+
+    # 1. Try local file
+    saved = _load_auth()
+    if saved:
+        token, brand = saved
+        log.info("Using token from auth.txt")
+        with auth_lock:
+            auth_token = token
+            brand_id = brand
+            token_updated.set()
+        return token, brand
+
+    # 2. Perform API login
     body = json.dumps({
         "username": USERNAME,
         "password": PASSWORD,
@@ -202,13 +222,9 @@ def authenticate() -> Tuple[str, str]:
         "http://schemas.ragingriver.io/ws/2021/05/identity/claims/brand",
         "f8a8d16a-d619-4b49-aa8c-f21211403c92",
     )
-    # 3. Save to environment
-    os.environ["BETWAY_TOKEN"] = token
-    os.environ["BETWAY_BRAND"] = brand
-    log.info("Authenticated and saved token to environment.")
+    _save_auth(token, brand)
 
     with auth_lock:
-        global auth_token, brand_id
         auth_token = token
         brand_id = brand
         token_updated.set()
@@ -241,7 +257,6 @@ def fetch_live_data(token: str) -> Optional[Dict[str, Any]]:
     return resp.json()
 
 def background_fetcher() -> None:
-    global auth_token, brand_id
     while True:
         with auth_lock:
             token = auth_token
@@ -399,7 +414,7 @@ def post_bet(token: str, brand: str, payload: Dict[str, Any]) -> Tuple[bool, boo
     return False, False, None, "Unknown error"
 
 # ------------------------------------------------------------------------------
-# Bet worker (retries + marking) – used for both win and draw bets
+# Bet worker (retries + marking)
 # ------------------------------------------------------------------------------
 def bet_worker(event_id: int, pick: str, match_name: str) -> None:
     global placed_bets, betting_in_progress
@@ -474,7 +489,7 @@ def bet_worker(event_id: int, pick: str, match_name: str) -> None:
     finally:
         with progress_lock:
             betting_in_progress.discard(event_id)
-            placed_bets.add(event_id)   # one bet per match
+            placed_bets.add(event_id)
 
 # ------------------------------------------------------------------------------
 # Main loop
@@ -498,7 +513,7 @@ def main() -> None:
             e for e in raw.get("events", [])
             if e.get("regionId") == "esoccer"
             and e.get("leagueId") == "gt-leagues"
-            and e.get("isActive", False)
+            and e.get("isActive", False)   # only active matches
         ]
 
         if gt_events:
@@ -533,9 +548,7 @@ def main() -> None:
 
             # --- Condition 1: bet on winning team if elapsed >= 11 and diff >= 2 ---
             if elapsed_min >= 11 and goal_diff >= 2:
-                # determine winning side
                 pick = "home" if home_score > away_score else "away"
-                # mark in‑progress and launch thread
                 with progress_lock:
                     if eid in placed_bets or eid in betting_in_progress:
                         continue
@@ -544,7 +557,6 @@ def main() -> None:
                 t = threading.Thread(target=bet_worker, args=(eid, pick, match_name), daemon=True)
                 t.start()
                 active_bet_threads.append(t)
-                # remove any pending draw timer if exists
                 with timer_lock:
                     draw_timers.pop(eid, None)
                 continue
@@ -560,7 +572,7 @@ def main() -> None:
                     else:
                         start_time = draw_timers[eid]
                 if now - start_time >= EXTRA_SECONDS:
-                    # time's up – check if still a draw (re‑read scores from live data to be safe)
+                    # Verify still a draw using latest data
                     with data_lock:
                         latest_event = None
                         for ev in latest_raw.get("events", []):
@@ -571,7 +583,6 @@ def main() -> None:
                         gs_latest = latest_event.get("gameStateTimeScore", {})
                         h, a = get_score(gs_latest)
                         if h == a:
-                            # mark in‑progress and bet
                             with progress_lock:
                                 if eid in placed_bets or eid in betting_in_progress:
                                     continue
@@ -580,7 +591,6 @@ def main() -> None:
                             t = threading.Thread(target=bet_worker, args=(eid, "draw", match_name), daemon=True)
                             t.start()
                             active_bet_threads.append(t)
-                    # remove timer regardless
                     with timer_lock:
                         draw_timers.pop(eid, None)
 
