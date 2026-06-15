@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Betway GT League Bot – In‑Play 1X2 (Goal Difference / Draw after Delay)
-- Loads authentication from a local file (auth.txt). If missing or invalid,
-  performs a fresh login and saves the token to auth.txt.
+Betway GT League Bot – In‑Play 1X2 (Goal Difference / Draw on Equaliser)
+Version 3. Live.py by Sanne Karibo
 - Places a bet on the winning team when elapsed >= 11 min and goal diff >= 2.
-- Places a bet on the draw when elapsed >= 11 min + EXTRA_SECONDS and the score is still level.
+- Places a bet on the draw ONLY when a goal makes the score level after minute 11
+  (i.e. the match was not a draw before, and becomes a draw after 11’).
 - Retries on transient errors, prevents duplicate bets.
 """
 
@@ -31,7 +31,6 @@ WAGER_AMOUNT: int = 100               # Stake in NGN
 IS_LIVE: bool = True                  # Actually place bets (False = dry run)
 ONE_TIME: bool = False                # Exit after first successful bet
 LOG_LEVEL: str = "INFO"               # DEBUG / INFO / WARNING / ERROR
-EXTRA_SECONDS: int = 45               # Additional seconds after 11th minute before draw bet
 MAX_RETRIES: int = 3                  # Max retries on hidden errors
 
 # ------------------------------------------------------------------------------
@@ -78,9 +77,9 @@ progress_lock = threading.Lock()
 
 shutdown_event = threading.Event()
 
-# per‑match draw‑timer start (real‑time seconds since epoch)
-draw_timers: Dict[int, float] = {}
-timer_lock = threading.Lock()
+# Previous scores for draw‑equaliser detection
+prev_scores: Dict[int, Tuple[int, int]] = {}
+prev_scores_lock = threading.Lock()
 
 # Local auth file
 AUTH_FILE = "auth.txt"
@@ -495,9 +494,9 @@ def bet_worker(event_id: int, pick: str, match_name: str) -> None:
 # Main loop
 # ------------------------------------------------------------------------------
 def main() -> None:
-    global placed_bets, betting_in_progress, draw_timers
-    log.info("Bot starting. IS_LIVE = %s, Wager = %d NGN, ONE_TIME = %s, Extra sec = %d",
-             IS_LIVE, WAGER_AMOUNT, ONE_TIME, EXTRA_SECONDS)
+    global placed_bets, betting_in_progress, prev_scores
+    log.info("Bot starting. IS_LIVE = %s, Wager = %d NGN, ONE_TIME = %s",
+             IS_LIVE, WAGER_AMOUNT, ONE_TIME)
 
     authenticate()
     fetcher_thread = threading.Thread(target=background_fetcher, daemon=True)
@@ -529,12 +528,6 @@ def main() -> None:
 
         for event in gt_events:
             eid = event["eventId"]
-
-            # Already handled?
-            with progress_lock:
-                if eid in placed_bets or eid in betting_in_progress:
-                    continue
-
             gs = event.get("gameStateTimeScore", {})
             elapsed_min = gs.get("time")
             if not isinstance(elapsed_min, (int, float)):
@@ -546,63 +539,57 @@ def main() -> None:
             match_name = f"{event['homeTeam']} vs {event['awayTeam']}"
             goal_diff = abs(home_score - away_score)
 
+            # Retrieve previous known score for this match
+            with prev_scores_lock:
+                prev = prev_scores.get(eid)
+
             # --- Condition 1: bet on winning team if elapsed >= 11 and diff >= 2 ---
             if elapsed_min >= 11 and goal_diff >= 2:
                 pick = "home" if home_score > away_score else "away"
                 with progress_lock:
                     if eid in placed_bets or eid in betting_in_progress:
+                        # Update score anyway, then skip
+                        with prev_scores_lock:
+                            prev_scores[eid] = (home_score, away_score)
                         continue
                     betting_in_progress.add(eid)
                 log.info("Condition WIN: %s (%d:%d) – betting on %s", match_name, home_score, away_score, pick)
                 t = threading.Thread(target=bet_worker, args=(eid, pick, match_name), daemon=True)
                 t.start()
                 active_bet_threads.append(t)
-                with timer_lock:
-                    draw_timers.pop(eid, None)
+                # Update score after betting attempt
+                with prev_scores_lock:
+                    prev_scores[eid] = (home_score, away_score)
                 continue
 
-            # --- Condition 2: bet on draw after extra seconds, if still a draw ---
-            if elapsed_min >= 11 and home_score == away_score:
-                now = time.time()
-                with timer_lock:
-                    if eid not in draw_timers:
-                        draw_timers[eid] = now
-                        log.info("Draw timer started for %s (score %d:%d), will wait %ds", match_name, home_score, away_score, EXTRA_SECONDS)
-                        continue
-                    else:
-                        start_time = draw_timers[eid]
-                if now - start_time >= EXTRA_SECONDS:
-                    # Verify still a draw using latest data
-                    with data_lock:
-                        latest_event = None
-                        for ev in latest_raw.get("events", []):
-                            if ev["eventId"] == eid:
-                                latest_event = ev
-                                break
-                    if latest_event:
-                        gs_latest = latest_event.get("gameStateTimeScore", {})
-                        h, a = get_score(gs_latest)
-                        if h == a:
-                            with progress_lock:
-                                if eid in placed_bets or eid in betting_in_progress:
-                                    continue
-                                betting_in_progress.add(eid)
-                            log.info("Condition DRAW: %s (%d:%d) – betting on draw after %ds", match_name, h, a, EXTRA_SECONDS)
+            # --- Condition 2: bet on draw ONLY if score became a draw after minute 11 ---
+            if elapsed_min >= 11:
+                # Check if current score is a draw and previous known score was NOT a draw
+                if home_score == away_score and prev is not None and prev[0] != prev[1]:
+                    with progress_lock:
+                        if eid not in placed_bets and eid not in betting_in_progress:
+                            betting_in_progress.add(eid)
+                            log.info("Condition DRAW (equaliser): %s (%d:%d) – betting on draw",
+                                     match_name, home_score, away_score)
                             t = threading.Thread(target=bet_worker, args=(eid, "draw", match_name), daemon=True)
                             t.start()
                             active_bet_threads.append(t)
-                    with timer_lock:
-                        draw_timers.pop(eid, None)
+                # Always update the stored score for this match (even if no bet placed)
+                with prev_scores_lock:
+                    prev_scores[eid] = (home_score, away_score)
+            else:
+                # For matches before minute 11, just store current score for future comparisons
+                with prev_scores_lock:
+                    prev_scores[eid] = (home_score, away_score)
 
         # Clean up finished threads
         active_bet_threads = [t for t in active_bet_threads if t.is_alive()]
 
-        # Clean up draw timers for vanished matches
-        with timer_lock:
-            for eid in list(draw_timers.keys()):
+        # Remove previous scores for matches that are no longer active
+        with prev_scores_lock:
+            for eid in list(prev_scores.keys()):
                 if eid not in current_ids:
-                    log.info("Match %d vanished – draw timer discarded", eid)
-                    del draw_timers[eid]
+                    del prev_scores[eid]
 
         time.sleep(0.5)
 
@@ -616,7 +603,7 @@ def main() -> None:
 # ------------------------------------------------------------------------------
 def parse_overrides() -> None:
     global IS_LIVE, ONE_TIME, LOG_LEVEL
-    parser = argparse.ArgumentParser(description="Betway GT League Bot (goal diff / draw delay)")
+    parser = argparse.ArgumentParser(description="Betway GT League Bot (goal diff / equaliser draw)")
     parser.add_argument("--live", action="store_true", default=None,
                         help="Enable live betting (otherwise dry run)")
     parser.add_argument("--one-time", action="store_true", default=None,
