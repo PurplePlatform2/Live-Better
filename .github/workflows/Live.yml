@@ -1,4 +1,4 @@
-name: Run live.py
+name: Run live.py sequentially
 
 on:
   push:
@@ -7,18 +7,45 @@ on:
   workflow_dispatch:
 
 jobs:
-  run:
+  run1:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - run: pip install requests && python live.py
 
-      - name: Run live.py
-        run: pip install requests && python live.py
+  run2:
+    needs: run1          # waits for run1 to finish
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests && python live.py
+
+  run3:
+    needs: run2          # waits for run2
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests && python live.py
+
+  run4:
+    needs: run3          # waits for run3
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests && python live.py
