@@ -18,7 +18,8 @@ jobs:
       - run: pip install requests && python live.py
 
   run2:
-    needs: run1          # waits for run1 to finish
+    needs: run1          
+    if: always() # waits for run1 to finish
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
@@ -29,7 +30,8 @@ jobs:
       - run: pip install requests && python live.py
 
   run3:
-    needs: run2          # waits for run2
+    needs: run2         
+    if: always() # waits for run2
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
@@ -40,7 +42,8 @@ jobs:
       - run: pip install requests && python live.py
 
   run4:
-    needs: run3          # waits for run3
+    needs: run3  
+    if: always() # waits for run3
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
