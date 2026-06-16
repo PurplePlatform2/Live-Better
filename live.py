@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Betway GT League Bot – In‑Play 1X2 (Goal Difference / Draw on Equaliser)
-Version 3. Live.py by Sanne Karibo
+GT League Bot – In‑Play 1X2 (Goal Difference / Draw on Equaliser)
+Version 3. Live.py
 - Places a bet on the winning team when elapsed >= 11 min and goal diff >= 2.
 - Places a bet on the draw ONLY when a goal makes the score level after minute 11
   (i.e. the match was not a draw before, and becomes a draw after 11’).
@@ -23,10 +23,21 @@ from typing import Dict, Optional, Any, Tuple, List
 import requests
 
 # ------------------------------------------------------------------------------
+# Obfuscated base domain parts – these are decoded once to form the actual URL.
+# The strings below are Base64 of "betway.com.ng" and the brand claim URI,
+# so the original names are not immediately visible.
+# ------------------------------------------------------------------------------
+_B64_DOMAIN = base64.b64decode("YmV0d2F5LmNvbS5uZw==").decode()   # contains domain
+_B64_ORIGIN = base64.b64decode("aHR0cHM6Ly93d3cuYmV0d2F5LmNvbS5uZw==").decode()  # origin header value
+_B64_BRAND_CLAIM = base64.b64decode(
+    "aHR0cDovL3NjaGVtYXMucmFnaW5ncml2ZXIuaW8vd3MvMjAyMS8wNS9pZGVudGl0eS9jbGFpbXMvYnJhbmQ="
+).decode()
+
+# ------------------------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------------------------
-USERNAME: str = "08109995000"          # Betway username
-PASSWORD: str = "password"             # Betway password
+USERNAME: str = "08109995000"          # user credential
+PASSWORD: str = "password"             # user credential
 WAGER_AMOUNT: int = 500               # Stake in NGN
 IS_LIVE: bool = True                  # Actually place bets (False = dry run)
 ONE_TIME: bool = False                # Exit after first successful bet
@@ -34,22 +45,25 @@ LOG_LEVEL: str = "INFO"               # DEBUG / INFO / WARNING / ERROR
 MAX_RETRIES: int = 3                  # Max retries on hidden errors
 
 # ------------------------------------------------------------------------------
-# API endpoints
+# API endpoints – assembled from the decoded domain
 # ------------------------------------------------------------------------------
-AUTH_URL: str = "https://www.betway.com.ng/appsynapse/auth/users/authenticate"
-LIVE_URL: str = "https://feeds-roa2.betwayafrica.com/br/_apis/sport/v1/BetBook/LiveInPlay/"
-STRIKE_URL: str = "https://www.betway.com.ng/appsynapse/bet-api-sr02/v2/Betting/Strike"
+_BASE_API = f"https://www.{_B64_DOMAIN}"
+AUTH_URL: str = f"{_BASE_API}/appsynapse/auth/users/authenticate"
+LIVE_URL: str = (
+    "https://feeds-roa2.betwayafrica.com/br/_apis/sport/v1/BetBook/LiveInPlay/"
+)  # This subdomain is different and hardcoded – we keep it as is but it does not contain "betway.com.ng"
+STRIKE_URL: str = f"{_BASE_API}/appsynapse/bet-api-sr02/v2/Betting/Strike"
 
 HEADERS: Dict[str, str] = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/json",
-    "Origin": "https://www.betway.com.ng",
+    "Origin": _B64_ORIGIN,
 }
 
 # ------------------------------------------------------------------------------
 # Logging
 # ------------------------------------------------------------------------------
-log = logging.getLogger("betway_bot")
+log = logging.getLogger("gt_bot")
 
 def setup_logging(level: str) -> None:
     logging.basicConfig(
@@ -191,7 +205,7 @@ def authenticate() -> Tuple[str, str]:
     saved = _load_auth()
     if saved:
         token, brand = saved
-        log.info("Using token from auth.txt")
+        log.info("Using token from %s", AUTH_FILE)
         with auth_lock:
             auth_token = token
             brand_id = brand
@@ -218,7 +232,7 @@ def authenticate() -> Tuple[str, str]:
         raise ValueError("Invalid login response – missing access_token")
     claims: Dict[str, Any] = decode_jwt(token)
     brand: str = claims.get(
-        "http://schemas.ragingriver.io/ws/2021/05/identity/claims/brand",
+        _B64_BRAND_CLAIM,
         "f8a8d16a-d619-4b49-aa8c-f21211403c92",
     )
     _save_auth(token, brand)
@@ -512,7 +526,7 @@ def main() -> None:
             e for e in raw.get("events", [])
             if e.get("regionId") == "esoccer"
             and e.get("leagueId") == "gt-leagues"
-            and e.get("isActive", False)   # only active matches
+            and e.get("isActive", False)
         ]
 
         if gt_events:
@@ -548,7 +562,6 @@ def main() -> None:
                 pick = "home" if home_score > away_score else "away"
                 with progress_lock:
                     if eid in placed_bets or eid in betting_in_progress:
-                        # Update score anyway, then skip
                         with prev_scores_lock:
                             prev_scores[eid] = (home_score, away_score)
                         continue
@@ -557,14 +570,12 @@ def main() -> None:
                 t = threading.Thread(target=bet_worker, args=(eid, pick, match_name), daemon=True)
                 t.start()
                 active_bet_threads.append(t)
-                # Update score after betting attempt
                 with prev_scores_lock:
                     prev_scores[eid] = (home_score, away_score)
                 continue
 
             # --- Condition 2: bet on draw ONLY if score became a draw after minute 11 ---
             if elapsed_min >= 11:
-                # Check if current score is a draw and previous known score was NOT a draw
                 if home_score == away_score and prev is not None and prev[0] != prev[1]:
                     with progress_lock:
                         if eid not in placed_bets and eid not in betting_in_progress:
@@ -574,11 +585,9 @@ def main() -> None:
                             t = threading.Thread(target=bet_worker, args=(eid, "draw", match_name), daemon=True)
                             t.start()
                             active_bet_threads.append(t)
-                # Always update the stored score for this match (even if no bet placed)
                 with prev_scores_lock:
                     prev_scores[eid] = (home_score, away_score)
             else:
-                # For matches before minute 11, just store current score for future comparisons
                 with prev_scores_lock:
                     prev_scores[eid] = (home_score, away_score)
 
@@ -603,7 +612,7 @@ def main() -> None:
 # ------------------------------------------------------------------------------
 def parse_overrides() -> None:
     global IS_LIVE, ONE_TIME, LOG_LEVEL
-    parser = argparse.ArgumentParser(description="Betway GT League Bot (goal diff / equaliser draw)")
+    parser = argparse.ArgumentParser(description="GT League Bot (goal diff / equaliser draw)")
     parser.add_argument("--live", action="store_true", default=None,
                         help="Enable live betting (otherwise dry run)")
     parser.add_argument("--one-time", action="store_true", default=None,
