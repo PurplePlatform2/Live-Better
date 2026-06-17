@@ -1,69 +1,50 @@
 #!/usr/bin/env python3
 """
-GT League Bot – In‑Play 1X2 (Goal Difference / Draw on Equaliser)
-Version 3. Live.py
-- Places a bet on the winning team when elapsed >= 11 min and goal diff >= 2.
-- Places a bet on the draw ONLY when a goal makes the score level after minute 11
-  (i.e. the match was not a draw before, and becomes a draw after 11’).
-- Retries on transient errors, prevents duplicate bets.
+GT League Match Logger – JSON Output
+- Saves initial match snapshot to firstMatches.json
+- Logs all goal, minute-11 detail, and match-end events to Matches.json
+- Runs for a configurable duration (default 2 hours)
+Based on Live.py by Sanne Karibo.
 """
 
 import os
 import time
 import json
 import base64
-import uuid
 import logging
 import traceback
 import sys
 import argparse
 import threading
+from datetime import datetime
 from typing import Dict, Optional, Any, Tuple, List
 
 import requests
 
 # ------------------------------------------------------------------------------
-# Obfuscated base domain parts – these are decoded once to form the actual URL.
-# The strings below are Base64 of "betway.com.ng" and the brand claim URI,
-# so the original names are not immediately visible.
-# ------------------------------------------------------------------------------
-_B64_DOMAIN = base64.b64decode("YmV0d2F5LmNvbS5uZw==").decode()   # contains domain
-_B64_ORIGIN = base64.b64decode("aHR0cHM6Ly93d3cuYmV0d2F5LmNvbS5uZw==").decode()  # origin header value
-_B64_BRAND_CLAIM = base64.b64decode(
-    "aHR0cDovL3NjaGVtYXMucmFnaW5ncml2ZXIuaW8vd3MvMjAyMS8wNS9pZGVudGl0eS9jbGFpbXMvYnJhbmQ="
-).decode()
-
-# ------------------------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------------------------
-USERNAME: str = "08109995000"          # user credential
-PASSWORD: str = "password"             # user credential
-WAGER_AMOUNT: int = 500               # Stake in NGN
-IS_LIVE: bool = True                  # Actually place bets (False = dry run)
-ONE_TIME: bool = False                # Exit after first successful bet
-LOG_LEVEL: str = "INFO"               # DEBUG / INFO / WARNING / ERROR
-MAX_RETRIES: int = 3                  # Max retries on hidden errors
+USERNAME: str = "08109995000"          # Betway username
+PASSWORD: str = "password"             # Betway password
+LOG_LEVEL: str = "INFO"                # DEBUG / INFO / WARNING / ERROR
+DURATION_SECONDS: int = 7200           # 2 hours
 
 # ------------------------------------------------------------------------------
-# API endpoints – assembled from the decoded domain
+# API endpoints (unchanged)
 # ------------------------------------------------------------------------------
-_BASE_API = f"https://www.{_B64_DOMAIN}"
-AUTH_URL: str = f"{_BASE_API}/appsynapse/auth/users/authenticate"
-LIVE_URL: str = (
-    "https://feeds-roa2.betwayafrica.com/br/_apis/sport/v1/BetBook/LiveInPlay/"
-)  # This subdomain is different and hardcoded – we keep it as is but it does not contain "betway.com.ng"
-STRIKE_URL: str = f"{_BASE_API}/appsynapse/bet-api-sr02/v2/Betting/Strike"
+AUTH_URL: str = "https://www.betway.com.ng/appsynapse/auth/users/authenticate"
+LIVE_URL: str = "https://feeds-roa2.betwayafrica.com/br/_apis/sport/v1/BetBook/LiveInPlay/"
 
 HEADERS: Dict[str, str] = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/json",
-    "Origin": _B64_ORIGIN,
+    "Origin": "https://www.betway.com.ng",
 }
 
 # ------------------------------------------------------------------------------
 # Logging
 # ------------------------------------------------------------------------------
-log = logging.getLogger("gt_bot")
+log = logging.getLogger("match_logger")
 
 def setup_logging(level: str) -> None:
     logging.basicConfig(
@@ -85,15 +66,16 @@ brand_id: str = ""
 auth_lock = threading.Lock()
 token_updated = threading.Event()
 
-placed_bets: set[int] = set()          # matches already handled
-betting_in_progress: set[int] = set()  # matches currently being bet on
-progress_lock = threading.Lock()
-
 shutdown_event = threading.Event()
 
-# Previous scores for draw‑equaliser detection
-prev_scores: Dict[int, Tuple[int, int]] = {}
-prev_scores_lock = threading.Lock()
+# Match state tracking (goal detection, minute-11 dedup)
+match_state: Dict[int, Dict[str, Any]] = {}
+state_lock = threading.Lock()
+
+# JSON accumulators
+initial_matches: List[Dict[str, Any]] = []   # snapshot at first data
+all_events: List[Dict[str, Any]] = []        # ongoing events
+first_snapshot_taken = False
 
 # Local auth file
 AUTH_FILE = "auth.txt"
@@ -101,9 +83,6 @@ AUTH_FILE = "auth.txt"
 # ------------------------------------------------------------------------------
 # Utilities
 # ------------------------------------------------------------------------------
-def generate_uuid() -> str:
-    return str(uuid.uuid4())
-
 def decode_jwt(token: str) -> Dict[str, Any]:
     try:
         parts = token.split(".")
@@ -116,71 +95,70 @@ def decode_jwt(token: str) -> Dict[str, Any]:
     except Exception:
         return {}
 
-def get_score(game_state: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+def get_score_and_time(game_state: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """Return (home_score, away_score, elapsed_seconds) from gameStateTimeScore."""
     score_list = game_state.get("score")
+    home_score = away_score = None
     if isinstance(score_list, list) and len(score_list) >= 2:
         try:
-            return int(score_list[0]), int(score_list[1])
+            home_score = int(score_list[0])
+            away_score = int(score_list[1])
         except (ValueError, TypeError):
             pass
-    return None, None
 
-def _is_hidden_error(error_text: str, data_obj: Optional[Dict[str, Any]] = None) -> bool:
-    triggers = ["price", "version", "changed", "expired", "no longer available",
-                "selection not found", "market suspended", "outcome changed"]
-    if any(t in error_text.lower() for t in triggers):
-        return True
-
-    if data_obj:
+    elapsed = game_state.get("time")
+    elapsed_sec = None
+    if isinstance(elapsed, (int, float)):
+        elapsed_sec = int(elapsed)
+    elif isinstance(elapsed, str):
         try:
-            for bet_resp in data_obj.get("betResponses", []):
-                if bet_resp.get("errorCode") == 100001:
-                    return True
-                err_meta = bet_resp.get("errorMetaData", {})
-                if err_meta.get("code") == 100001:
-                    return True
-                for sel in err_meta.get("erroredSelections", []):
-                    if sel.get("errorCode") == 100001:
-                        return True
-        except Exception:
+            elapsed_sec = int(float(elapsed))
+        except ValueError:
             pass
-    return False
+    return home_score, away_score, elapsed_sec
 
-def parse_bet_response(data_obj: Dict[str, Any]) -> Tuple[bool, bool, Optional[str]]:
-    if not data_obj:
-        return False, False, "Empty response"
-    bet_responses = data_obj.get("betResponses", [])
-    if not bet_responses:
-        return data_obj.get("isSuccessful", False), False, "No bet responses"
+def get_match_odds(raw: Dict[str, Any], event_id: int) -> Dict[str, Optional[float]]:
+    """Return dict with 'home', 'draw', 'away' decimal odds for 1X2 market."""
+    events = {e["eventId"]: e for e in raw.get("events", [])}
+    prices_map = {p["outcomeId"]: p for p in raw.get("prices", [])}
+    outcomes_by_market: Dict[int, list] = {}
+    for o in raw.get("outcomes", []):
+        outcomes_by_market.setdefault(o["marketId"], []).append(o)
 
-    success = True
-    hidden = False
-    error_messages = []
-    for resp in bet_responses:
-        is_success = resp.get("isSuccessful", False)
-        placement = resp.get("placementStatus", "")
-        error_code = resp.get("errorCode", 0)
-        if not is_success or placement == "Error":
-            success = False
-            error_meta = resp.get("errorMetaData", {})
-            msg = error_meta.get("message") or resp.get("errorMessage") or "Unknown error"
-            error_messages.append(f"[{error_code}] {msg}")
-            if error_code == 100001 or _is_hidden_error(msg):
-                hidden = True
-        else:
-            if placement != "Accepted":
-                success = False
-                error_messages.append(f"placementStatus={placement}")
-    return (True, False, None) if success else (False, hidden, "; ".join(error_messages))
+    odds = {"home": None, "draw": None, "away": None}
+    event = events.get(event_id)
+    if not event:
+        return odds
+
+    for market in raw.get("markets", []):
+        if market["eventId"] != event_id:
+            continue
+        if market.get("marketTypeCName") not in ("win-draw-win", "1X2"):
+            continue
+        m_id = market["marketId"]
+        for outcome in outcomes_by_market.get(m_id, []):
+            name = outcome["name"]
+            if name == "Draw":
+                key = "draw"
+            elif name == event["homeTeam"]:
+                key = "home"
+            elif name == event["awayTeam"]:
+                key = "away"
+            else:
+                continue
+            price_obj = prices_map.get(outcome["outcomeId"])
+            if price_obj and "priceDecimal" in price_obj:
+                odds[key] = price_obj["priceDecimal"]
+        break
+    return odds
 
 # ------------------------------------------------------------------------------
-# Authentication – load from auth.txt, fallback to API login and save
+# Authentication (same as original)
 # ------------------------------------------------------------------------------
 def _save_auth(token: str, brand: str) -> None:
     try:
         with open(AUTH_FILE, "w") as f:
             json.dump({"token": token, "brand": brand}, f)
-        log.info("Authentication saved to %s", AUTH_FILE)
     except Exception as e:
         log.warning("Could not save auth file: %s", e)
 
@@ -192,7 +170,7 @@ def _load_auth() -> Optional[Tuple[str, str]]:
             data = json.load(f)
         token = data.get("token")
         brand = data.get("brand")
-        if token and brand and decode_jwt(token):  # quick sanity check
+        if token and brand and decode_jwt(token):
             return token, brand
     except Exception:
         pass
@@ -200,19 +178,16 @@ def _load_auth() -> Optional[Tuple[str, str]]:
 
 def authenticate() -> Tuple[str, str]:
     global auth_token, brand_id
-
-    # 1. Try local file
     saved = _load_auth()
     if saved:
         token, brand = saved
-        log.info("Using token from %s", AUTH_FILE)
+        log.info("Using token from auth.txt")
         with auth_lock:
             auth_token = token
             brand_id = brand
             token_updated.set()
         return token, brand
 
-    # 2. Perform API login
     body = json.dumps({
         "username": USERNAME,
         "password": PASSWORD,
@@ -226,13 +201,13 @@ def authenticate() -> Tuple[str, str]:
         timeout=15,
     )
     resp.raise_for_status()
-    data: Dict[str, Any] = resp.json()
-    token: Optional[str] = data.get("access_token")
+    data = resp.json()
+    token = data.get("access_token")
     if not token:
         raise ValueError("Invalid login response – missing access_token")
-    claims: Dict[str, Any] = decode_jwt(token)
-    brand: str = claims.get(
-        _B64_BRAND_CLAIM,
+    claims = decode_jwt(token)
+    brand = claims.get(
+        "http://schemas.ragingriver.io/ws/2021/05/identity/claims/brand",
         "f8a8d16a-d619-4b49-aa8c-f21211403c92",
     )
     _save_auth(token, brand)
@@ -244,7 +219,7 @@ def authenticate() -> Tuple[str, str]:
     return token, brand
 
 # ------------------------------------------------------------------------------
-# Background data fetcher
+# Background data fetcher (unchanged)
 # ------------------------------------------------------------------------------
 def fetch_live_data(token: str) -> Optional[Dict[str, Any]]:
     params = {
@@ -299,344 +274,196 @@ def background_fetcher() -> None:
             time.sleep(1)
 
 # ------------------------------------------------------------------------------
-# Selection & payload builders
+# Event logging helpers (JSON)
 # ------------------------------------------------------------------------------
-def build_selection(raw: Dict[str, Any], event_id: int, pick: str) -> Optional[Dict[str, Any]]:
-    events = {e["eventId"]: e for e in raw.get("events", [])}
-    prices_map = {p["outcomeId"]: p for p in raw.get("prices", [])}
-    outcomes_by_market: Dict[int, list] = {}
-    for o in raw.get("outcomes", []):
-        outcomes_by_market.setdefault(o["marketId"], []).append(o)
-
-    event = events.get(event_id)
-    if not event:
-        return None
-
-    for market in raw.get("markets", []):
-        if market["eventId"] != event_id:
-            continue
-        if market.get("marketTypeCName") not in ("win-draw-win", "1X2"):
-            continue
-        m_id: int = market["marketId"]
-        for outcome in outcomes_by_market.get(m_id, []):
-            matched = False
-            if pick == "draw" and outcome["name"] == "Draw":
-                matched = True
-            elif pick == "home" and outcome["name"] == event["homeTeam"]:
-                matched = True
-            elif pick == "away" and outcome["name"] == event["awayTeam"]:
-                matched = True
-            if not matched:
-                continue
-
-            price_obj = prices_map.get(outcome["outcomeId"])
-            if not price_obj:
-                continue
-
-            return {
-                "price": price_obj["priceDecimal"],
-                "eventId": event["eventId"],
-                "marketId": market["marketId"],
-                "outcomeId": outcome["outcomeId"],
-                "eventVersion": event["version"],
-                "marketVersion": market["version"],
-                "outcomeVersion": outcome["version"],
-                "priceVersion": price_obj["version"],
-                "priceNum": price_obj["numerator"],
-                "priceDen": price_obj["denominator"],
-                "publicHubPublishedTime": price_obj.get("publicHubPublishedTime"),
-                "serverEmopSource": price_obj.get("emopSource", 1),
-            }
-    return None
-
-def build_bet_payload(selection: Dict[str, Any], wager_amount: int) -> Dict[str, Any]:
-    request_id = generate_uuid()
+def create_event_dict(event_id: int, home_team: str, away_team: str,
+                      elapsed_sec: Optional[int], home_score: Optional[int],
+                      away_score: Optional[int], odds: Dict[str, Optional[float]],
+                      event_type: str, notes: str = "") -> Dict[str, Any]:
     return {
-        "currencyCode": "NGN",
-        "countryCode": "NG",
-        "betRequests": [{
-            "requestId": request_id,
-            "paymentType": 1,
-            "betSelectionType": "Normal",
-            "numberOfLines": 1,
-            "acceptPriceChange": "None",
-            "isEachWay": False,
-            "channel": "web",
-            "handicap": 0,
-            "priceNum": selection["priceNum"],
-            "priceDen": selection["priceDen"],
-            "referringBookingCode": "",
-            "wagerAmount": wager_amount,
-            "bets": [{
-                "priceType": "Normal",
-                "handicap": 0,
-                "priceDen": selection["priceDen"],
-                "priceNum": selection["priceNum"],
-                "priceDec": selection["price"],
-                "isEachWayActive": False,
-                "eventId": selection["eventId"],
-                "marketId": selection["marketId"],
-                "displayMarketId": selection["marketId"],
-                "outcomeId": [selection["outcomeId"]],
-                "eventVersion": selection["eventVersion"],
-                "marketVersion": selection["marketVersion"],
-                "outcomeVersion": selection["outcomeVersion"],
-                "priceVersion": selection["priceVersion"],
-                "serverEmopSource": selection["serverEmopSource"],
-                "publicHubPublishedTime": selection["publicHubPublishedTime"],
-            }],
-        }],
+        "system_time": datetime.now().isoformat(),
+        "match_id": event_id,
+        "home_team": home_team,
+        "away_team": away_team,
+        "elapsed_seconds": elapsed_sec,
+        "home_score": home_score,
+        "away_score": away_score,
+        "home_odds": odds.get("home"),
+        "draw_odds": odds.get("draw"),
+        "away_odds": odds.get("away"),
+        "event_type": event_type,
+        "notes": notes,
     }
 
-def post_bet(token: str, brand: str, payload: Dict[str, Any]) -> Tuple[bool, bool, Optional[Dict], Optional[str]]:
-    headers = {
-        **HEADERS,
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "X-Brand-Id": brand,
-    }
-    body = json.dumps(payload)
-    try:
-        resp = requests.post(STRIKE_URL, headers=headers, data=body, timeout=20)
-    except requests.exceptions.RequestException as e:
-        return False, False, None, f"HTTP error: {e}"
-
-    data_obj = None
-    try:
-        data_obj = resp.json() if resp.text else None
-    except ValueError:
-        pass
-
-    if resp.status_code == 200 and data_obj:
-        success, hidden, detail = parse_bet_response(data_obj)
-        if success:
-            return True, False, data_obj, None
-        return False, hidden, data_obj, detail
-
-    if resp.status_code == 400:
-        hidden = _is_hidden_error(resp.text, data_obj)
-        return False, hidden, data_obj, resp.text
-
-    if resp.status_code == 401:
-        return False, False, None, "401 Unauthorized"
-
-    try:
-        resp.raise_for_status()
-    except Exception as e:
-        return False, False, None, str(e)
-    return False, False, None, "Unknown error"
-
 # ------------------------------------------------------------------------------
-# Bet worker (retries + marking)
+# Main processing loop
 # ------------------------------------------------------------------------------
-def bet_worker(event_id: int, pick: str, match_name: str) -> None:
-    global placed_bets, betting_in_progress
-    retries = 0
-    log.info("Thread for match %d (%s) – betting on %s", event_id, match_name, pick)
+def process_matches() -> None:
+    global first_snapshot_taken, initial_matches, all_events, match_state
 
-    try:
-        while retries <= MAX_RETRIES and not shutdown_event.is_set():
-            with data_lock:
-                raw_bet = dict(latest_raw)
+    with data_lock:
+        raw = dict(latest_raw)
 
-            # Verify event still active
-            event_bet = None
-            for ev in raw_bet.get("events", []):
-                if ev["eventId"] == event_id:
-                    event_bet = ev
-                    break
-            if not event_bet or not event_bet.get("isActive", False):
-                log.warning("Match %d gone/inactive – giving up", event_id)
-                break
+    gt_events = [
+        e for e in raw.get("events", [])
+        if e.get("regionId") == "esoccer"
+        and e.get("leagueId") == "gt-leagues"
+    ]
+    current_ids = {ev["eventId"] for ev in gt_events}
 
-            selection = build_selection(raw_bet, event_id, pick)
-            if not selection:
-                log.warning("Could not build selection for %d – retrying", event_id)
-                retries += 1
-                continue
+    # --- First snapshot: all active matches at this moment ---
+    if not first_snapshot_taken and gt_events:
+        log.info("Taking initial snapshot of %d match(es).", len(gt_events))
+        for event in gt_events:
+            eid = event["eventId"]
+            home_team = event.get("homeTeam", "?")
+            away_team = event.get("awayTeam", "?")
+            gs = event.get("gameStateTimeScore", {})
+            home_score, away_score, elapsed_sec = get_score_and_time(gs)
+            odds = get_match_odds(raw, eid)
+            initial_matches.append({
+                "match_id": eid,
+                "home_team": home_team,
+                "away_team": away_team,
+                "snapshot_time": datetime.now().isoformat(),
+                "initial_score": {"home": home_score, "away": away_score},
+                "initial_elapsed_seconds": elapsed_sec,
+                "initial_odds": odds,
+            })
+        # Save immediately (overwrite each time, but it's static now)
+        with open("firstMatches.json", "w", encoding="utf-8") as f:
+            json.dump(initial_matches, f, indent=2, default=str)
+        log.info("firstMatches.json written with %d entries.", len(initial_matches))
+        first_snapshot_taken = True
 
-            payload = build_bet_payload(selection, WAGER_AMOUNT)
+    # --- Process event detection for each match ---
+    for event in gt_events:
+        eid = event["eventId"]
+        home_team = event.get("homeTeam", "?")
+        away_team = event.get("awayTeam", "?")
+        gs = event.get("gameStateTimeScore", {})
+        home_score, away_score, elapsed_sec = get_score_and_time(gs)
 
-            if not IS_LIVE:
-                log.info("❌ Dry run – bet NOT placed for %s (pick=%s).", match_name, pick)
-                break
+        if home_score is None or away_score is None:
+            continue
 
-            with auth_lock:
-                tok = auth_token
-                bid = brand_id
-            success, hidden_error, resp_data, err_text = post_bet(tok, bid, payload)
+        odds = get_match_odds(raw, eid)
 
-            if success:
-                try:
-                    first_resp = resp_data.get("betResponses", [{}])[0]
-                    betslip = first_resp.get("betslipId")
-                    booking = first_resp.get("bookingCode")
-                    log.info("✅ Bet placed successfully! Betslip: %s, Booking: %s", betslip, booking)
-                except Exception:
-                    log.info("✅ Bet placed successfully! Response: %s", resp_data)
-                if ONE_TIME:
-                    shutdown_event.set()
-                break
+        with state_lock:
+            if eid not in match_state:
+                # First time we see this match (after snapshot, or if it appeared later)
+                match_state[eid] = {
+                    "prev_score": (home_score, away_score),
+                    "logged_minute11": set(),
+                    "home_team": home_team,
+                    "away_team": away_team,
+                }
+                # We do not log a "match_start" event here because the snapshot already captured it.
+                # If a match appears after snapshot, you could optionally log it; skipping for simplicity.
 
-            if hidden_error:
-                retries += 1
-                if retries <= MAX_RETRIES:
-                    log.info("Hidden error – retry %d/%d instantly", retries, MAX_RETRIES)
-                    continue
-                else:
-                    log.error("Max retries reached for match %d – giving up", event_id)
-                    break
-            elif "401" in str(err_text):
-                log.warning("Got 401 – re‑authenticating…")
-                try:
-                    authenticate()
-                except Exception as e:
-                    log.error("Re‑auth failed: %s", e)
-                retries += 1
-                if retries > MAX_RETRIES:
-                    break
-                continue
+            state = match_state[eid]
+            prev_home, prev_away = state["prev_score"]
+
+            # Goal detection
+            if home_score != prev_home or away_score != prev_away:
+                goal_scorer = ""
+                if home_score > prev_home:
+                    goal_scorer = f"{home_team} scored (now {home_score}-{away_score})"
+                elif away_score > prev_away:
+                    goal_scorer = f"{away_team} scored (now {home_score}-{away_score})"
+                all_events.append(create_event_dict(
+                    eid, home_team, away_team, elapsed_sec,
+                    home_score, away_score, odds,
+                    "goal", goal_scorer
+                ))
+                state["prev_score"] = (home_score, away_score)
+                state["logged_minute11"].clear()
+                log.info("Goal: %s vs %s %d-%d at %d sec",
+                         home_team, away_team, home_score, away_score, elapsed_sec)
+
+            # Minute-11 detailed logging
+            if elapsed_sec is not None and 660 <= elapsed_sec <= 719:
+                if elapsed_sec not in state["logged_minute11"]:
+                    all_events.append(create_event_dict(
+                        eid, home_team, away_team, elapsed_sec,
+                        home_score, away_score, odds,
+                        "minute11_second", f"minute 11, second {elapsed_sec-660}"
+                    ))
+                    state["logged_minute11"].add(elapsed_sec)
             else:
-                log.error("Non‑recoverable error: %s – giving up on %s", err_text, match_name)
-                break
-    finally:
-        with progress_lock:
-            betting_in_progress.discard(event_id)
-            placed_bets.add(event_id)
+                state["logged_minute11"].clear()
+
+            # Update stored score
+            state["prev_score"] = (home_score, away_score)
+
+    # Match end detection (matches that disappeared from active list)
+    with state_lock:
+        for eid in list(match_state.keys()):
+            if eid not in current_ids:
+                state = match_state[eid]
+                last_home, last_away = state["prev_score"]
+                # We cannot know the exact elapsed time at end, so leave it None
+                all_events.append(create_event_dict(
+                    eid, state["home_team"], state["away_team"],
+                    None, last_home, last_away,
+                    {"home": None, "draw": None, "away": None},
+                    "match_ended", "No longer in active list"
+                ))
+                log.info("Match ended: %s vs %s (%d-%d)", state["home_team"],
+                         state["away_team"], last_home, last_away)
+                # Remove from state so we don't log end repeatedly
+                del match_state[eid]
 
 # ------------------------------------------------------------------------------
-# Main loop
+# Main entry point
 # ------------------------------------------------------------------------------
-def main() -> None:
-    global placed_bets, betting_in_progress, prev_scores
-    log.info("Bot starting. IS_LIVE = %s, Wager = %d NGN, ONE_TIME = %s",
-             IS_LIVE, WAGER_AMOUNT, ONE_TIME)
+def main(duration: int) -> None:
+    log.info("Logger starting. Duration = %d seconds.", duration)
 
-    authenticate()
+    #authenticate()
     fetcher_thread = threading.Thread(target=background_fetcher, daemon=True)
     fetcher_thread.start()
 
-    active_bet_threads: List[threading.Thread] = []
-
-    while not shutdown_event.is_set():
-        with data_lock:
-            raw = dict(latest_raw)
-
-        gt_events = [
-            e for e in raw.get("events", [])
-            if e.get("regionId") == "esoccer"
-            and e.get("leagueId") == "gt-leagues"
-            and e.get("isActive", False)
-        ]
-
-        if gt_events:
-            log.info("Found %d GT League match(es):", len(gt_events))
-            for ev in gt_events:
-                gs = ev.get("gameStateTimeScore", {})
-                home_score, away_score = get_score(gs)
-                score_str = f"{home_score}-{away_score}" if home_score is not None else "?-?"
-                log.info("  %s vs %s  (%s, elapsed: %s min)", ev["homeTeam"], ev["awayTeam"],
-                         score_str, gs.get("time", "?"))
-
-        current_ids = {ev["eventId"] for ev in gt_events}
-
-        for event in gt_events:
-            eid = event["eventId"]
-            gs = event.get("gameStateTimeScore", {})
-            elapsed_min = gs.get("time")
-            if not isinstance(elapsed_min, (int, float)):
-                continue
-            home_score, away_score = get_score(gs)
-            if home_score is None or away_score is None:
-                continue
-
-            match_name = f"{event['homeTeam']} vs {event['awayTeam']}"
-            goal_diff = abs(home_score - away_score)
-
-            # Retrieve previous known score for this match
-            with prev_scores_lock:
-                prev = prev_scores.get(eid)
-
-            # --- Condition 1: bet on winning team if elapsed >= 11 and diff >= 2 ---
-            if elapsed_min >= 11 and goal_diff >= 2:
-                pick = "home" if home_score > away_score else "away"
-                with progress_lock:
-                    if eid in placed_bets or eid in betting_in_progress:
-                        with prev_scores_lock:
-                            prev_scores[eid] = (home_score, away_score)
-                        continue
-                    betting_in_progress.add(eid)
-                log.info("Condition WIN: %s (%d:%d) – betting on %s", match_name, home_score, away_score, pick)
-                t = threading.Thread(target=bet_worker, args=(eid, pick, match_name), daemon=True)
-                t.start()
-                active_bet_threads.append(t)
-                with prev_scores_lock:
-                    prev_scores[eid] = (home_score, away_score)
-                continue
-
-            # --- Condition 2: bet on draw ONLY if score became a draw after minute 11 ---
-            if elapsed_min >= 11:
-                if home_score == away_score and prev is not None and prev[0] != prev[1]:
-                    with progress_lock:
-                        if eid not in placed_bets and eid not in betting_in_progress:
-                            betting_in_progress.add(eid)
-                            log.info("Condition DRAW (equaliser): %s (%d:%d) – betting on draw",
-                                     match_name, home_score, away_score)
-                            t = threading.Thread(target=bet_worker, args=(eid, "draw", match_name), daemon=True)
-                            t.start()
-                            active_bet_threads.append(t)
-                with prev_scores_lock:
-                    prev_scores[eid] = (home_score, away_score)
-            else:
-                with prev_scores_lock:
-                    prev_scores[eid] = (home_score, away_score)
-
-        # Clean up finished threads
-        active_bet_threads = [t for t in active_bet_threads if t.is_alive()]
-
-        # Remove previous scores for matches that are no longer active
-        with prev_scores_lock:
-            for eid in list(prev_scores.keys()):
-                if eid not in current_ids:
-                    del prev_scores[eid]
-
+    # Wait until we have at least some data
+    log.info("Waiting for first data poll...")
+    while not latest_raw and not shutdown_event.is_set():
         time.sleep(0.5)
+    start_time = time.time()
 
-    log.info("Bot shutdown requested. Waiting for active bet threads...")
-    for t in active_bet_threads:
-        t.join(timeout=5)
-    log.info("Bot stopped cleanly.")
+    log.info("Logging active. Will run for %.0f seconds.", duration)
+    try:
+        while not shutdown_event.is_set() and (time.time() - start_time) < duration:
+            process_matches()
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        shutdown_event.set()
+    finally:
+        # Save the full event log to Matches.json
+        log.info("Writing Matches.json with %d events...", len(all_events))
+        with open("Matches.json", "w", encoding="utf-8") as f:
+            json.dump(all_events, f, indent=2, default=str)
+        log.info("Matches.json saved.")
+        log.info("Logger stopped cleanly.")
 
 # ------------------------------------------------------------------------------
 # Command‑line overrides
 # ------------------------------------------------------------------------------
 def parse_overrides() -> None:
-    global IS_LIVE, ONE_TIME, LOG_LEVEL
-    parser = argparse.ArgumentParser(description="GT League Bot (goal diff / equaliser draw)")
-    parser.add_argument("--live", action="store_true", default=None,
-                        help="Enable live betting (otherwise dry run)")
-    parser.add_argument("--one-time", action="store_true", default=None,
-                        help="Exit after first successful bet")
-    parser.add_argument("--debug", action="store_true", default=False,
-                        help="Shortcut: dry‑run + one‑time + DEBUG logging")
+    global LOG_LEVEL, DURATION_SECONDS
+    parser = argparse.ArgumentParser(description="GT League Match Logger (JSON)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable DEBUG logging")
+    parser.add_argument("--duration", type=int, default=DURATION_SECONDS,
+                        help=f"Total run time in seconds (default {DURATION_SECONDS})")
     args, _ = parser.parse_known_args()
-
     if args.debug:
-        IS_LIVE = False
-        ONE_TIME = True
         LOG_LEVEL = "DEBUG"
-    else:
-        if args.live is not None:
-            IS_LIVE = args.live
-        if args.one_time is not None:
-            ONE_TIME = args.one_time
+    DURATION_SECONDS = args.duration
 
 if __name__ == "__main__":
     parse_overrides()
     setup_logging(LOG_LEVEL)
     try:
-        main()
-    except KeyboardInterrupt:
-        log.info("Bot stopped by user.")
+        main(DURATION_SECONDS)
     except Exception:
         log.critical("Fatal error:\n%s", traceback.format_exc())
