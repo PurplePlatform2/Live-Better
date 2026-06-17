@@ -1,0 +1,98 @@
+name: Run Match Logger Sequentially
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  run1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies & run logger
+        run: |
+          pip install requests
+          python match_logger.py
+      - name: Upload logs (run1)
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-run1
+          path: |
+            firstMatches.json
+            Matches.json
+          retention-days: 30
+
+  run2:
+    needs: run1          
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies & run logger
+        run: |
+          pip install requests
+          python match_logger.py
+      - name: Upload logs (run2)
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-run2
+          path: |
+            firstMatches.json
+            Matches.json
+          retention-days: 30
+
+  run3:
+    needs: run2         
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies & run logger
+        run: |
+          pip install requests
+          python match_logger.py
+      - name: Upload logs (run3)
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-run3
+          path: |
+            firstMatches.json
+            Matches.json
+          retention-days: 30
+
+  run4:
+    needs: run3  
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies & run logger
+        run: |
+          pip install requests
+          python match_logger.py
+      - name: Upload logs (run4)
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-run4
+          path: |
+            firstMatches.json
+            Matches.json
+          retention-days: 30
