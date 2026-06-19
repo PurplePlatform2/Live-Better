@@ -1,6 +1,9 @@
 name: Run live.py sequentially for a week
 
-on:
+on: 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
  
   workflow_dispatch:
