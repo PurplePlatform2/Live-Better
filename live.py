@@ -1,5 +1,3 @@
-
-
 import os
 import time
 import json
@@ -227,6 +225,12 @@ def authenticate() -> Tuple[str, str]:
         token_updated.set()
     return token, brand
 
+def reauthenticate() -> Tuple[str, str]:
+    """Force a fresh login by removing the cached auth file."""
+    if os.path.exists(AUTH_FILE):
+        os.remove(AUTH_FILE)
+    return authenticate()
+
 # ------------------------------------------------------------------------------
 # Background data fetcher
 # ------------------------------------------------------------------------------
@@ -271,7 +275,7 @@ def background_fetcher() -> None:
             if e.response is not None and e.response.status_code == 401:
                 log.warning("Fetcher got 401 – re‑authenticating…")
                 try:
-                    authenticate()
+                    reauthenticate()
                 except Exception as auth_err:
                     log.error("Fetcher re‑auth failed: %s", auth_err)
                     time.sleep(5)
@@ -475,7 +479,7 @@ def bet_worker(event_id: int, pick: str, match_name: str, wager_amount: int) -> 
             elif "401" in str(err_text):
                 log.warning("Got 401 – re‑authenticating…")
                 try:
-                    authenticate()
+                    reauthenticate()
                 except Exception as e:
                     log.error("Re‑auth failed: %s", e)
                 retries += 1
@@ -491,6 +495,25 @@ def bet_worker(event_id: int, pick: str, match_name: str, wager_amount: int) -> 
             placed_bets.add(event_id)
 
 # ------------------------------------------------------------------------------
+# Log clearing (every minute, default)
+# ------------------------------------------------------------------------------
+LOG_FILE = "betway_bot.log"
+
+def clear_log_file():
+    """Truncate the log file if it exists."""
+    try:
+        if os.path.exists(LOG_FILE):
+            with open(LOG_FILE, "w"):
+                pass
+    except Exception:
+        pass
+
+def log_clear_loop():
+    while not shutdown_event.is_set():
+        clear_log_file()
+        shutdown_event.wait(60)   # wait up to 60 seconds or until shutdown
+
+# ------------------------------------------------------------------------------
 # Main loop
 # ------------------------------------------------------------------------------
 def main() -> None:
@@ -501,6 +524,10 @@ def main() -> None:
     authenticate()
     fetcher_thread = threading.Thread(target=background_fetcher, daemon=True)
     fetcher_thread.start()
+
+    # Start log clearing thread
+    log_clearer = threading.Thread(target=log_clear_loop, daemon=True)
+    log_clearer.start()
 
     active_bet_threads: List[threading.Thread] = []
 
