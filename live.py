@@ -16,8 +16,8 @@ import requests
 # Configuration
 # ------------------------------------------------------------------------------
 USERNAME: str = "08109995000"          # Demo Betway username
-PASSWORD: str = "password"             # Demo Betway password
-WAGER_AMOUNT: int = 2000               # Stake in NGN (maximum)
+PASSWORD: str = "passwords"             # Demo Betway password
+WAGER_AMOUNT: int = 200               # Stake in NGN (maximum)
 IS_LIVE: bool = True                  # Actually place bets (False = dry run)
 ONE_TIME: bool = False                # Exit after first successful bet
 LOG_LEVEL: str = "INFO"               # DEBUG / INFO / WARNING / ERROR
@@ -67,14 +67,8 @@ progress_lock = threading.Lock()
 
 shutdown_event = threading.Event()
 
-# Previous scores for draw‑equaliser detection
-prev_scores: Dict[int, Tuple[int, int]] = {}
-prev_scores_lock = threading.Lock()
-
-# ------------------------------------------------------------------------------
-# NEW: Track when a match entered minute 11 (for wager scaling)
-# ------------------------------------------------------------------------------
-minute_11_start: Dict[int, float] = {}  # event_id -> timestamp (time.time())
+# Track when each match entered minute 11 (real-time timestamp)
+minute_11_start: Dict[int, float] = {}
 minute_11_lock = threading.Lock()
 
 # Local auth file
@@ -225,12 +219,6 @@ def authenticate() -> Tuple[str, str]:
         token_updated.set()
     return token, brand
 
-def reauthenticate() -> Tuple[str, str]:
-    """Force a fresh login by removing the cached auth file."""
-    if os.path.exists(AUTH_FILE):
-        os.remove(AUTH_FILE)
-    return authenticate()
-
 # ------------------------------------------------------------------------------
 # Background data fetcher
 # ------------------------------------------------------------------------------
@@ -275,7 +263,7 @@ def background_fetcher() -> None:
             if e.response is not None and e.response.status_code == 401:
                 log.warning("Fetcher got 401 – re‑authenticating…")
                 try:
-                    reauthenticate()
+                    authenticate()
                 except Exception as auth_err:
                     log.error("Fetcher re‑auth failed: %s", auth_err)
                     time.sleep(5)
@@ -415,7 +403,7 @@ def post_bet(token: str, brand: str, payload: Dict[str, Any]) -> Tuple[bool, boo
     return False, False, None, "Unknown error"
 
 # ------------------------------------------------------------------------------
-# Bet worker (retries + marking)  <-- modified to accept wager_amount
+# Bet worker (retries + marking)
 # ------------------------------------------------------------------------------
 def bet_worker(event_id: int, pick: str, match_name: str, wager_amount: int) -> None:
     global placed_bets, betting_in_progress
@@ -479,7 +467,7 @@ def bet_worker(event_id: int, pick: str, match_name: str, wager_amount: int) -> 
             elif "401" in str(err_text):
                 log.warning("Got 401 – re‑authenticating…")
                 try:
-                    reauthenticate()
+                    authenticate()
                 except Exception as e:
                     log.error("Re‑auth failed: %s", e)
                 retries += 1
@@ -495,39 +483,16 @@ def bet_worker(event_id: int, pick: str, match_name: str, wager_amount: int) -> 
             placed_bets.add(event_id)
 
 # ------------------------------------------------------------------------------
-# Log clearing (every minute, default)
-# ------------------------------------------------------------------------------
-LOG_FILE = "betway_bot.log"
-
-def clear_log_file():
-    """Truncate the log file if it exists."""
-    try:
-        if os.path.exists(LOG_FILE):
-            with open(LOG_FILE, "w"):
-                pass
-    except Exception:
-        pass
-
-def log_clear_loop():
-    while not shutdown_event.is_set():
-        clear_log_file()
-        shutdown_event.wait(60)   # wait up to 60 seconds or until shutdown
-
-# ------------------------------------------------------------------------------
 # Main loop
 # ------------------------------------------------------------------------------
 def main() -> None:
-    global placed_bets, betting_in_progress, prev_scores
+    global placed_bets, betting_in_progress
     log.info("Bot starting. IS_LIVE = %s, Wager = %d NGN (max), ONE_TIME = %s",
              IS_LIVE, WAGER_AMOUNT, ONE_TIME)
 
     authenticate()
     fetcher_thread = threading.Thread(target=background_fetcher, daemon=True)
     fetcher_thread.start()
-
-    # Start log clearing thread
-    log_clearer = threading.Thread(target=log_clear_loop, daemon=True)
-    log_clearer.start()
 
     active_bet_threads: List[threading.Thread] = []
 
@@ -566,7 +531,7 @@ def main() -> None:
             match_name = f"{event['homeTeam']} vs {event['awayTeam']}"
             goal_diff = abs(home_score - away_score)
 
-            # ---------- NEW: Track minute-11 start time ----------
+            # ---------- Track minute-11 start time ----------
             if elapsed_min >= 11:
                 with minute_11_lock:
                     if eid not in minute_11_start:
@@ -580,20 +545,16 @@ def main() -> None:
                 # scale: 0 sec -> 0%, 60 sec -> 100%, capped at WAGER_AMOUNT
                 factor = min(1.0, seconds_since_11 / 60.0)
                 current_wager = int(WAGER_AMOUNT * factor)
-                # (minimum of 1 if factor > 0? keeps bet possible, adjust as you like)
                 if current_wager < 1 and factor > 0:
                     current_wager = 1
             else:
-                current_wager = WAGER_AMOUNT  # not used yet, but safe default
+                current_wager = WAGER_AMOUNT  # not used before minute 11
 
             # --- Condition 1: bet on winning team if elapsed >= 11 and diff >= 2 ---
             if elapsed_min >= 11 and goal_diff >= 2:
                 pick = "home" if home_score > away_score else "away"
                 with progress_lock:
                     if eid in placed_bets or eid in betting_in_progress:
-                        # Update score anyway, then skip
-                        with prev_scores_lock:
-                            prev_scores[eid] = (home_score, away_score)
                         continue
                     betting_in_progress.add(eid)
                 log.info("Condition WIN: %s (%d:%d) – betting on %s with %d NGN",
@@ -601,38 +562,33 @@ def main() -> None:
                 t = threading.Thread(target=bet_worker, args=(eid, pick, match_name, current_wager), daemon=True)
                 t.start()
                 active_bet_threads.append(t)
-                with prev_scores_lock:
-                    prev_scores[eid] = (home_score, away_score)
                 continue
 
-            # --- Condition 2: bet on draw ONLY if score became a draw after minute 11 ---
+            # --- Condition 2: 59‑second timer draw bet ---
             if elapsed_min >= 11:
-                with prev_scores_lock:
-                    prev = prev_scores.get(eid)
-                if home_score == away_score and prev is not None and prev[0] != prev[1]:
-                    with progress_lock:
-                        if eid not in placed_bets and eid not in betting_in_progress:
+                with minute_11_lock:
+                    start_time = minute_11_start.get(eid)
+                if start_time is None:
+                    continue
+                seconds_since_11 = time.time() - start_time
+                if seconds_since_11 >= 59:   # timer expired
+                    if home_score == away_score:  # still a draw
+                        with progress_lock:
+                            if eid in placed_bets or eid in betting_in_progress:
+                                continue
                             betting_in_progress.add(eid)
-                            log.info("Condition DRAW (equaliser): %s (%d:%d) – betting on draw with %d NGN",
-                                     match_name, home_score, away_score, current_wager)
-                            t = threading.Thread(target=bet_worker, args=(eid, "draw", match_name, current_wager), daemon=True)
-                            t.start()
-                            active_bet_threads.append(t)
-                with prev_scores_lock:
-                    prev_scores[eid] = (home_score, away_score)
-            else:
-                # Before minute 11, just store score
-                with prev_scores_lock:
-                    prev_scores[eid] = (home_score, away_score)
+                        log.info("Condition DRAW (59s timer): %s (%d:%d) – betting on draw with %d NGN",
+                                 match_name, home_score, away_score, current_wager)
+                        t = threading.Thread(target=bet_worker, args=(eid, "draw", match_name, current_wager), daemon=True)
+                        t.start()
+                        active_bet_threads.append(t)
+                    # After the timer check, we do nothing else for this match
+                    # (it either bets or is skipped because scores changed)
 
         # Clean up finished threads
         active_bet_threads = [t for t in active_bet_threads if t.is_alive()]
 
         # Remove stored data for matches that are no longer active
-        with prev_scores_lock:
-            for eid in list(prev_scores.keys()):
-                if eid not in current_ids:
-                    del prev_scores[eid]
         with minute_11_lock:
             for eid in list(minute_11_start.keys()):
                 if eid not in current_ids:
@@ -650,7 +606,7 @@ def main() -> None:
 # ------------------------------------------------------------------------------
 def parse_overrides() -> None:
     global IS_LIVE, ONE_TIME, LOG_LEVEL
-    parser = argparse.ArgumentParser(description="Betway GT League Bot (goal diff / equaliser draw)")
+    parser = argparse.ArgumentParser(description="Betway GT League Bot (goal diff / 59s draw)")
     parser.add_argument("--live", action="store_true", default=None,
                         help="Enable live betting (otherwise dry run)")
     parser.add_argument("--one-time", action="store_true", default=None,
