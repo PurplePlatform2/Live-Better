@@ -4,7 +4,7 @@ name: Collect Match Data
 on:
   workflow_dispatch:
   
-    # Every 15 minutes
+    # Every 4hours m
   
 
 jobs:
@@ -33,14 +33,19 @@ jobs:
 
       - name: Run Collector
         run: |
-          timeout 5h python data.py
+          timeout 4h python data.py
 
-      - name: Upload Dataset
+      - name: Zip Dataset
+        if: always()
+        run: |
+          zip -r data.zip data
+
+      - name: Upload Zip
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: collected-data-${{ github.run_number }}
-          path: data/
-          if-no-files-found: warn
+          path: data.zip
           retention-days: 30
+
 
