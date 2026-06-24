@@ -13,15 +13,16 @@ from typing import Dict, Optional, Any, Tuple, List
 import requests
 
 # ------------------------------------------------------------------------------
-# Configuration
+# Configuration (can be overridden via command line)
 # ------------------------------------------------------------------------------
-USERNAME: str = "08109995000"          # Demo Betway username
-PASSWORD: str = "passwords"             # Demo Betway password
-WAGER_AMOUNT: int = 200               # Stake in NGN (maximum)
-IS_LIVE: bool = True                  # Actually place bets (False = dry run)
-ONE_TIME: bool = False                # Exit after first successful bet
-LOG_LEVEL: str = "INFO"               # DEBUG / INFO / WARNING / ERROR
-MAX_RETRIES: int = 3                  # Max retries on hidden errors
+USERNAME: str = "08109995000"          # Default Betway username
+PASSWORD: str = "passwords"            # Default Betway password
+WAGER_AMOUNT: int = 100                # Default stake in NGN
+ENTRY_TIME: int = 55
+IS_LIVE: bool = True                   # Actually place bets (False = dry run)
+ONE_TIME: bool = False                 # Exit after first successful bet
+LOG_LEVEL: str = "INFO"                # DEBUG / INFO / WARNING / ERROR
+MAX_RETRIES: int = 3                   # Max retries on hidden errors
 
 # ------------------------------------------------------------------------------
 # API endpoints
@@ -487,7 +488,7 @@ def bet_worker(event_id: int, pick: str, match_name: str, wager_amount: int) -> 
 # ------------------------------------------------------------------------------
 def main() -> None:
     global placed_bets, betting_in_progress
-    log.info("Bot starting. IS_LIVE = %s, Wager = %d NGN (max), ONE_TIME = %s",
+    log.info("Bot starting. IS_LIVE = %s, Wager = %d NGN, ONE_TIME = %s",
              IS_LIVE, WAGER_AMOUNT, ONE_TIME)
 
     authenticate()
@@ -506,15 +507,6 @@ def main() -> None:
             and e.get("leagueId") == "gt-leagues"
             and e.get("isActive", False)   # only active matches
         ]
-
-        if gt_events:
-            log.info("Found %d GT League match(es):", len(gt_events))
-            for ev in gt_events:
-                gs = ev.get("gameStateTimeScore", {})
-                home_score, away_score = get_score(gs)
-                score_str = f"{home_score}-{away_score}" if home_score is not None else "?-?"
-                log.info("  %s vs %s  (%s, elapsed: %s min)", ev["homeTeam"], ev["awayTeam"],
-                         score_str, gs.get("time", "?"))
 
         current_ids = {ev["eventId"] for ev in gt_events}
 
@@ -536,19 +528,9 @@ def main() -> None:
                 with minute_11_lock:
                     if eid not in minute_11_start:
                         minute_11_start[eid] = time.time()
-                        log.info("Minute 11 started for match %d (%s)", eid, match_name)
 
-                # Compute wager based on how far we are into the 12-minute span
-                with minute_11_lock:
-                    start = minute_11_start.get(eid, time.time())
-                seconds_since_11 = time.time() - start
-                # scale: 0 sec -> 0%, 60 sec -> 100%, capped at WAGER_AMOUNT
-                factor = min(1.0, seconds_since_11 / 60.0)
-                current_wager = int(WAGER_AMOUNT * factor)
-                if current_wager < 1 and factor > 0:
-                    current_wager = 1
-            else:
-                current_wager = WAGER_AMOUNT  # not used before minute 11
+            # Always use fixed stake amount – no scaling
+            current_wager = WAGER_AMOUNT
 
             # --- Condition 1: bet on winning team if elapsed >= 11 and diff >= 2 ---
             if elapsed_min >= 11 and goal_diff >= 2:
@@ -557,8 +539,6 @@ def main() -> None:
                     if eid in placed_bets or eid in betting_in_progress:
                         continue
                     betting_in_progress.add(eid)
-                log.info("Condition WIN: %s (%d:%d) – betting on %s with %d NGN",
-                         match_name, home_score, away_score, pick, current_wager)
                 t = threading.Thread(target=bet_worker, args=(eid, pick, match_name, current_wager), daemon=True)
                 t.start()
                 active_bet_threads.append(t)
@@ -571,19 +551,16 @@ def main() -> None:
                 if start_time is None:
                     continue
                 seconds_since_11 = time.time() - start_time
-                if seconds_since_11 >= 59:   # timer expired
+                if seconds_since_11 >= ENTRY_TIME:   # timer expired
                     if home_score == away_score:  # still a draw
                         with progress_lock:
                             if eid in placed_bets or eid in betting_in_progress:
                                 continue
                             betting_in_progress.add(eid)
-                        log.info("Condition DRAW (59s timer): %s (%d:%d) – betting on draw with %d NGN",
-                                 match_name, home_score, away_score, current_wager)
                         t = threading.Thread(target=bet_worker, args=(eid, "draw", match_name, current_wager), daemon=True)
                         t.start()
                         active_bet_threads.append(t)
                     # After the timer check, we do nothing else for this match
-                    # (it either bets or is skipped because scores changed)
 
         # Clean up finished threads
         active_bet_threads = [t for t in active_bet_threads if t.is_alive()]
@@ -602,10 +579,10 @@ def main() -> None:
     log.info("Bot stopped cleanly.")
 
 # ------------------------------------------------------------------------------
-# Command‑line overrides
+# Command‑line overrides (including wager, username, password)
 # ------------------------------------------------------------------------------
 def parse_overrides() -> None:
-    global IS_LIVE, ONE_TIME, LOG_LEVEL
+    global IS_LIVE, ONE_TIME, LOG_LEVEL, WAGER_AMOUNT, USERNAME, PASSWORD
     parser = argparse.ArgumentParser(description="Betway GT League Bot (goal diff / 59s draw)")
     parser.add_argument("--live", action="store_true", default=None,
                         help="Enable live betting (otherwise dry run)")
@@ -613,6 +590,12 @@ def parse_overrides() -> None:
                         help="Exit after first successful bet")
     parser.add_argument("--debug", action="store_true", default=False,
                         help="Shortcut: dry‑run + one‑time + DEBUG logging")
+    parser.add_argument("--wager", type=int, default=None,
+                        help="Stake amount in NGN (overrides default)")
+    parser.add_argument("--username", type=str, default=None,
+                        help="Betway username (overrides default)")
+    parser.add_argument("--password", type=str, default=None,
+                        help="Betway password (overrides default)")
     args, _ = parser.parse_known_args()
 
     if args.debug:
@@ -624,6 +607,13 @@ def parse_overrides() -> None:
             IS_LIVE = args.live
         if args.one_time is not None:
             ONE_TIME = args.one_time
+
+    if args.wager is not None:
+        WAGER_AMOUNT = args.wager
+    if args.username is not None:
+        USERNAME = args.username
+    if args.password is not None:
+        PASSWORD = args.password
 
 if __name__ == "__main__":
     parse_overrides()
