@@ -14,10 +14,10 @@ import requests
 # ------------------------------------------------------------------------------
 # Configuration (can be overridden via command line)
 # ------------------------------------------------------------------------------
-USERNAME: str = "08109995000"          # Default Betway username
-PASSWORD: str = "passwords"            # Default Betway password
-WAGER_AMOUNT: int = 110                # Default stake in NGN
-ENTRY_TIME: int = 57
+USERNAME: str = "08035796220"          # Default Betway username
+PASSWORD: str = "password"            # Default Betway password
+WAGER_AMOUNT: int = 8000                # Default stake in NGN
+ENTRY_TIME: int = 72
 IS_LIVE: bool = True                   # Actually place bets (False = dry run)
 ONE_TIME: bool = False                 # Exit after first successful bet
 LOG_LEVEL: str = "INFO"                # DEBUG / INFO / WARNING / ERROR
