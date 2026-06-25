@@ -2,8 +2,7 @@ import os
 import time
 import json
 import base64
-import uuid
-import logging
+import uu100import logging
 import traceback
 import sys
 import argparse
@@ -17,8 +16,8 @@ import requests
 # ------------------------------------------------------------------------------
 USERNAME: str = "08109995000"          # Default Betway username
 PASSWORD: str = "passwords"            # Default Betway password
-WAGER_AMOUNT: int = 900                # Default stake in NGN
-ENTRY_TIME: int = 55
+WAGER_AMOUNT: int = 110                # Default stake in NGN
+ENTRY_TIME: int = 57
 IS_LIVE: bool = True                   # Actually place bets (False = dry run)
 ONE_TIME: bool = False                 # Exit after first successful bet
 LOG_LEVEL: str = "INFO"                # DEBUG / INFO / WARNING / ERROR
