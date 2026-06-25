@@ -151,7 +151,7 @@ def parse_bet_response(data_obj: Dict[str, Any]) -> Tuple[bool, bool, Optional[s
     return (True, False, None) if success else (False, hidden, "; ".join(error_messages))
 
 # ------------------------------------------------------------------------------
-# Authentication – load from auth.txt, fallback to API login and save
+# Authentication â€“ load from auth.txt, fallback to API login and save
 # ------------------------------------------------------------------------------
 def _save_auth(token: str, brand: str) -> None:
     try:
@@ -169,25 +169,30 @@ def _load_auth() -> Optional[Tuple[str, str]]:
             data = json.load(f)
         token = data.get("token")
         brand = data.get("brand")
-        if token and brand and decode_jwt(token):  # quick sanity check
+        claims = decode_jwt(token) if token else {}
+        exp = claims.get("exp")
+        now = int(time.time())
+        # Accept only valid-looking, non-expired JWTs
+        if token and brand and claims and (exp is None or int(exp) > now):
             return token, brand
     except Exception:
         pass
     return None
 
-def authenticate() -> Tuple[str, str]:
+def authenticate(force_login: bool = False) -> Tuple[str, str]:
     global auth_token, brand_id
 
-    # 1. Try local file
-    saved = _load_auth()
-    if saved:
-        token, brand = saved
-        log.info("Using token from auth.txt")
-        with auth_lock:
-            auth_token = token
-            brand_id = brand
-            token_updated.set()
-        return token, brand
+    # 1. Try local file unless explicitly bypassed
+    if not force_login:
+        saved = _load_auth()
+        if saved:
+            token, brand = saved
+            log.info("Using token from auth.txt")
+            with auth_lock:
+                auth_token = token
+                brand_id = brand
+                token_updated.set()
+            return token, brand
 
     # 2. Perform API login
     body = json.dumps({
@@ -206,7 +211,7 @@ def authenticate() -> Tuple[str, str]:
     data: Dict[str, Any] = resp.json()
     token: Optional[str] = data.get("access_token")
     if not token:
-        raise ValueError("Invalid login response – missing access_token")
+        raise ValueError("Invalid login response â€“ missing access_token")
     claims: Dict[str, Any] = decode_jwt(token)
     brand: str = claims.get(
         "http://schemas.ragingriver.io/ws/2021/05/identity/claims/brand",
@@ -262,11 +267,11 @@ def background_fetcher() -> None:
             time.sleep(0.5)
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code == 401:
-                log.warning("Fetcher got 401 – re‑authenticating…")
+                log.warning("Fetcher got 401 â€“ reâ€‘authenticatingâ€¦")
                 try:
-                    authenticate()
+                    authenticate(force_login=True)
                 except Exception as auth_err:
-                    log.error("Fetcher re‑auth failed: %s", auth_err)
+                    log.error("Fetcher reâ€‘auth failed: %s", auth_err)
                     time.sleep(5)
             else:
                 log.error("Fetcher HTTP error: %s", e)
@@ -409,7 +414,7 @@ def post_bet(token: str, brand: str, payload: Dict[str, Any]) -> Tuple[bool, boo
 def bet_worker(event_id: int, pick: str, match_name: str, wager_amount: int) -> None:
     global placed_bets, betting_in_progress
     retries = 0
-    log.info("Thread for match %d (%s) – betting on %s with stake %d NGN",
+    log.info("Thread for match %d (%s) â€“ betting on %s with stake %d NGN",
              event_id, match_name, pick, wager_amount)
 
     try:
@@ -424,19 +429,19 @@ def bet_worker(event_id: int, pick: str, match_name: str, wager_amount: int) -> 
                     event_bet = ev
                     break
             if not event_bet or not event_bet.get("isActive", False):
-                log.warning("Match %d gone/inactive – giving up", event_id)
+                log.warning("Match %d gone/inactive â€“ giving up", event_id)
                 break
 
             selection = build_selection(raw_bet, event_id, pick)
             if not selection:
-                log.warning("Could not build selection for %d – retrying", event_id)
+                log.warning("Could not build selection for %d â€“ retrying", event_id)
                 retries += 1
                 continue
 
             payload = build_bet_payload(selection, wager_amount)
 
             if not IS_LIVE:
-                log.info("❌ Dry run – bet NOT placed for %s (pick=%s, stake=%d).",
+                log.info("âŒ Dry run â€“ bet NOT placed for %s (pick=%s, stake=%d).",
                          match_name, pick, wager_amount)
                 break
 
@@ -450,9 +455,9 @@ def bet_worker(event_id: int, pick: str, match_name: str, wager_amount: int) -> 
                     first_resp = resp_data.get("betResponses", [{}])[0]
                     betslip = first_resp.get("betslipId")
                     booking = first_resp.get("bookingCode")
-                    log.info("✅ Bet placed successfully! Betslip: %s, Booking: %s", betslip, booking)
+                    log.info("âœ… Bet placed successfully! Betslip: %s, Booking: %s", betslip, booking)
                 except Exception:
-                    log.info("✅ Bet placed successfully! Response: %s", resp_data)
+                    log.info("âœ… Bet placed successfully! Response: %s", resp_data)
                 if ONE_TIME:
                     shutdown_event.set()
                 break
@@ -460,23 +465,23 @@ def bet_worker(event_id: int, pick: str, match_name: str, wager_amount: int) -> 
             if hidden_error:
                 retries += 1
                 if retries <= MAX_RETRIES:
-                    log.info("Hidden error – retry %d/%d instantly", retries, MAX_RETRIES)
+                    log.info("Hidden error â€“ retry %d/%d instantly", retries, MAX_RETRIES)
                     continue
                 else:
-                    log.error("Max retries reached for match %d – giving up", event_id)
+                    log.error("Max retries reached for match %d â€“ giving up", event_id)
                     break
             elif "401" in str(err_text):
-                log.warning("Got 401 – re‑authenticating…")
+                log.warning("Got 401 â€“ reâ€‘authenticatingâ€¦")
                 try:
-                    authenticate()
+                    authenticate(force_login=True)
                 except Exception as e:
-                    log.error("Re‑auth failed: %s", e)
+                    log.error("Reâ€‘auth failed: %s", e)
                 retries += 1
                 if retries > MAX_RETRIES:
                     break
                 continue
             else:
-                log.error("Non‑recoverable error: %s – giving up on %s", err_text, match_name)
+                log.error("Nonâ€‘recoverable error: %s â€“ giving up on %s", err_text, match_name)
                 break
     finally:
         with progress_lock:
@@ -491,7 +496,7 @@ def main() -> None:
     log.info("Bot starting. IS_LIVE = %s, Wager = %d NGN, ONE_TIME = %s",
              IS_LIVE, WAGER_AMOUNT, ONE_TIME)
 
-    authenticate()
+    authenticate(force_login=False)
     fetcher_thread = threading.Thread(target=background_fetcher, daemon=True)
     fetcher_thread.start()
 
@@ -529,7 +534,7 @@ def main() -> None:
                     if eid not in minute_11_start:
                         minute_11_start[eid] = time.time()
 
-            # Always use fixed stake amount – no scaling
+            # Always use fixed stake amount â€“ no scaling
             current_wager = WAGER_AMOUNT
 
             # --- Condition 1: bet on winning team if elapsed >= 11 and diff >= 2 ---
@@ -544,7 +549,7 @@ def main() -> None:
                 active_bet_threads.append(t)
                 continue
 
-            # --- Condition 2: 59‑second timer draw bet ---
+            # --- Condition 2: 59â€‘second timer draw bet ---
             if elapsed_min >= 11:
                 with minute_11_lock:
                     start_time = minute_11_start.get(eid)
@@ -579,7 +584,7 @@ def main() -> None:
     log.info("Bot stopped cleanly.")
 
 # ------------------------------------------------------------------------------
-# Command‑line overrides (including wager, username, password)
+# Commandâ€‘line overrides (including wager, username, password)
 # ------------------------------------------------------------------------------
 def parse_overrides() -> None:
     global IS_LIVE, ONE_TIME, LOG_LEVEL, WAGER_AMOUNT, USERNAME, PASSWORD
@@ -589,7 +594,7 @@ def parse_overrides() -> None:
     parser.add_argument("--one-time", action="store_true", default=None,
                         help="Exit after first successful bet")
     parser.add_argument("--debug", action="store_true", default=False,
-                        help="Shortcut: dry‑run + one‑time + DEBUG logging")
+                        help="Shortcut: dryâ€‘run + oneâ€‘time + DEBUG logging")
     parser.add_argument("--wager", type=int, default=None,
                         help="Stake amount in NGN (overrides default)")
     parser.add_argument("--username", type=str, default=None,
