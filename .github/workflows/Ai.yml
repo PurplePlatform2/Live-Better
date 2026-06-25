@@ -24,7 +24,46 @@ jobs:
         with:
           script: |
             const currentRunId = context.runId;
-            
+            const repo = context.repo;
+
+            // Fetch all workflow runs that are in progress or queued
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRunsForRepo,
+              {
+                ...repo,
+                status: "in_progress",
+              }
+            );
+
+            for (const run of runs) {
+              // Skip the current run itself
+              if (run.id === currentRunId) {
+                console.log(`Skipping current run ${run.id}`);
+                continue;
+              }
+              console.log(`Cancelling run ${run.id} (${run.name}) from workflow "${run.workflow_id}"`);
+              await github.rest.actions.cancelWorkflowRun({
+                ...repo,
+                run_id: run.id,
+              });
+            }
+
+            // Also cancel queued runs (sometimes listed separately)
+            const queuedRuns = await github.paginate(
+              github.rest.actions.listWorkflowRunsForRepo,
+              {
+                ...repo,
+                status: "queued",
+              }
+            );
+            for (const run of queuedRuns) {
+              if (run.id === currentRunId) continue;
+              console.log(`Cancelling queued run ${run.id} (${run.name})`);
+              await github.rest.actions.cancelWorkflowRun({
+                ...repo,
+                run_id: run.id,
+              });
+            }
 
   # ──────────────────────────────────────────────────
   #  JOB 1 – starts with default auth.txt from repo
