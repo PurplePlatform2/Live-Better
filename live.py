@@ -17,7 +17,7 @@ import requests
 # ------------------------------------------------------------------------------
 USERNAME: str = "08109995000"          # Default Betway username
 PASSWORD: str = "passwords"            # Default Betway password
-WAGER_AMOUNT: int = 100                # Default stake in NGN
+WAGER_AMOUNT: int = 900                # Default stake in NGN
 ENTRY_TIME: int = 55
 IS_LIVE: bool = True                   # Actually place bets (False = dry run)
 ONE_TIME: bool = False                 # Exit after first successful bet
