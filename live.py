@@ -2,7 +2,8 @@ import os
 import time
 import json
 import base64
-import uu100import logging
+import uuid
+import logging
 import traceback
 import sys
 import argparse
