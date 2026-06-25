@@ -1,26 +1,24 @@
 import os
 import time
 import json
-import base64
-import uuid
 import threading
 import logging
 import traceback
 import sys
 import argparse
-from typing import Dict, Any, Optional, Tuple, List
+from datetime import datetime
+from typing import Dict, Any, Optional, Tuple
 
 import requests
 
 # ============================================================
 # CONFIG (can be overridden via command line)
 # ============================================================
-USERNAME: str = "Demo"          # Default Betway username
-PASSWORD: str = "swords"            # Default Betway password
+USERNAME: str = "Demo"
+PASSWORD: str = "swords"
 LOG_LEVEL: str = "INFO"
 
 # API endpoints
-AUTH_URL = "https://www.betway.com.ng/appsynapse/auth/users/authenticate"
 LIVE_URL = "https://feeds-roa2.betwayafrica.com/br/_apis/sport/v1/BetBook/LiveInPlay/"
 
 HEADERS = {
@@ -29,10 +27,10 @@ HEADERS = {
     "Origin": "https://www.betway.com.ng",
 }
 
-AUTH_FILE = "auth.txt"
-
 FETCH_INTERVAL = 0.5
 MATCHES_PER_FILE = 100
+LIVE_LOG_DIR = "data"
+LIVE_LOG_PREFIX = "live"
 
 # ============================================================
 # LOGGING
@@ -48,103 +46,100 @@ def setup_logging(level: str) -> None:
         stream=sys.stdout,
     )
 
+def now_wall() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 # ============================================================
 # SHARED STATE
 # ============================================================
 latest_raw: Dict[str, Any] = {}
 data_lock = threading.Lock()
-
-auth_token: str = ""
-brand_id: str = ""
-auth_lock = threading.Lock()
-token_updated = threading.Event()
-
 shutdown_event = threading.Event()
 
 # ============================================================
-# AUTH HELPERS
+# LIVE FILE WRITER
 # ============================================================
-def decode_jwt(token: str) -> Dict[str, Any]:
-    try:
-        parts = token.split(".")
-        if len(parts) != 3:
-            return {}
-        payload_b64 = parts[1].replace("-", "+").replace("_", "/")
-        payload_b64 += "=" * ((4 - len(payload_b64) % 4) % 4)
-        decoded = base64.b64decode(payload_b64).decode("utf-8")
-        return json.loads(decoded)
-    except Exception:
-        return {}
+class RollingLiveWriter:
+    def __init__(self, base_dir: str, prefix: str, max_matches: int = 100):
+        self.base_dir = base_dir
+        self.prefix = prefix
+        self.max_matches = max_matches
+        self.lock = threading.Lock()
+        self.file_index = 1
+        self.match_count = 0
+        os.makedirs(self.base_dir, exist_ok=True)
+        self._resume_or_create()
 
-def _save_auth(token: str, brand: str) -> None:
-    try:
-        with open(AUTH_FILE, "w") as f:
-            json.dump({"token": token, "brand": brand}, f)
-        log.info("Authentication saved to %s", AUTH_FILE)
-    except Exception as e:
-        log.warning("Could not save auth file: %s", e)
+    def _path(self, index: Optional[int] = None) -> str:
+        idx = self.file_index if index is None else index
+        return os.path.join(self.base_dir, f"{self.prefix}{idx}.txt")
 
-def _load_auth() -> Optional[Tuple[str, str]]:
-    if not os.path.exists(AUTH_FILE):
-        return None
-    try:
-        with open(AUTH_FILE, "r") as f:
-            data = json.load(f)
-        token = data.get("token")
-        brand = data.get("brand")
-        if token and brand and decode_jwt(token):
-            return token, brand
-    except Exception:
-        pass
-    return None
+    def _ensure_file(self, index: Optional[int] = None) -> None:
+        path = self._path(index)
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf8") as f:
+                f.write("wall_time|event|match_time|score|home_team|away_team|home_odds|draw_odds|away_odds|extra\n")
 
-def authenticate() -> Tuple[str, str]:
-    global auth_token, brand_id
+    def _count_starts(self, path: str) -> int:
+        try:
+            with open(path, "r", encoding="utf8") as f:
+                return sum(1 for line in f if "|START|" in line)
+        except Exception:
+            return 0
 
-    # 1. Try local file
-    saved = _load_auth()
-    if saved:
-        token, brand = saved
-        log.info("Using token from auth.txt")
-        with auth_lock:
-            auth_token = token
-            brand_id = brand
-            token_updated.set()
-        return token, brand
+    def _resume_or_create(self) -> None:
+        index = 1
+        while os.path.exists(self._path(index)):
+            index += 1
 
-    # 2. API login
-    body = json.dumps({
-        "username": USERNAME,
-        "password": PASSWORD,
-        "countryCode": "NG",
-        "sessionMetadata": {},
-    })
-    resp = requests.post(
-        AUTH_URL,
-        headers={**HEADERS, "Content-Type": "application/json"},
-        data=body,
-        timeout=15,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    token = data.get("access_token")
-    if not token:
-        raise ValueError("Invalid login response – missing access_token")
-    claims = decode_jwt(token)
-    brand = claims.get(
-        "http://schemas.ragingriver.io/ws/2021/05/identity/claims/brand",
-        "f8a8d16a-d619-4b49-aa8c-f21211403c92",
-    )
-    _save_auth(token, brand)
+        if index == 1:
+            self.file_index = 1
+            self.match_count = 0
+            self._ensure_file(1)
+            return
 
-    with auth_lock:
-        auth_token = token
-        brand_id = brand
-        token_updated.set()
-    return token, brand
+        last_index = index - 1
+        last_path = self._path(last_index)
+        count = self._count_starts(last_path)
+        if count >= self.max_matches:
+            self.file_index = index
+            self.match_count = 0
+            self._ensure_file(index)
+        else:
+            self.file_index = last_index
+            self.match_count = count
+            self._ensure_file(last_index)
+
+    def _rotate_if_needed(self) -> None:
+        if self.match_count >= self.max_matches:
+            self.file_index += 1
+            self.match_count = 0
+            self._ensure_file(self.file_index)
+
+    def start_match(self) -> None:
+        with self.lock:
+            self._rotate_if_needed()
+            self.match_count += 1
+            self._ensure_file(self.file_index)
+
+    def append(self, line: str) -> None:
+        with self.lock:
+            self._ensure_file(self.file_index)
+            with open(self._path(), "a", encoding="utf8") as f:
+                f.write(line + "\n")
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+
+    def current_path(self) -> str:
+        return self._path()
+
+live_writer = RollingLiveWriter(LIVE_LOG_DIR, LIVE_LOG_PREFIX, MATCHES_PER_FILE)
 
 # ============================================================
-# DATA WRITER (unchanged)
+# DATA WRITER (kept for completed match snapshots)
 # ============================================================
 class DatasetWriter:
     def __init__(self):
@@ -226,10 +221,37 @@ def get_match_odds(raw: Dict[str, Any], event_id: int):
         break
     return odds
 
+def odds_str(odds: Dict[str, Any]) -> str:
+    def fmt(v):
+        return "NA" if v is None else str(v)
+    return f"{fmt(odds.get('home'))},{fmt(odds.get('draw'))},{fmt(odds.get('away'))}"
+
+def odds_changed(before: Dict[str, Any], after: Dict[str, Any]) -> bool:
+    return (
+        before.get("home") != after.get("home") or
+        before.get("draw") != after.get("draw") or
+        before.get("away") != after.get("away")
+    )
+
+def log_live_line(event: Dict[str, Any], event_type: str,
+                  minute: Any, home_score: Any, away_score: Any,
+                  odds: Dict[str, Any], extra: str = "") -> None:
+    line = "|".join([
+        now_wall(),
+        event_type,
+        str(minute if minute is not None else "NA"),
+        f"{home_score}-{away_score}",
+        str(event.get("homeTeam", "HOME")),
+        str(event.get("awayTeam", "AWAY")),
+        odds_str(odds),
+        extra,
+    ])
+    live_writer.append(line)
+
 # ============================================================
-# FETCHER (with auth & GT‑league filter)
+# FETCHER
 # ============================================================
-def fetch_live_data(token: str) -> Optional[Dict[str, Any]]:
+def fetch_live_data() -> Optional[Dict[str, Any]]:
     params = {
         "countryCode": "NG",
         "sportId": "soccer",
@@ -245,24 +267,14 @@ def fetch_live_data(token: str) -> Optional[Dict[str, Any]]:
             "[Double Chance]",
         ],
     }
-    headers = {**HEADERS}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    resp = requests.get(LIVE_URL, params=params, headers=headers, timeout=15)
+    resp = requests.get(LIVE_URL, params=params, headers=HEADERS, timeout=15)
     resp.raise_for_status()
     return resp.json()
 
 def background_fetcher() -> None:
     while not shutdown_event.is_set():
-        with auth_lock:
-            token = auth_token
-        if not token:
-            token_updated.wait()
-            token_updated.clear()
-            continue
         try:
-            raw = fetch_live_data(token)
-            # Filter to only GT leagues before storing
+            raw = fetch_live_data()
             filtered_events = [
                 e for e in raw.get("events", [])
                 if e.get("regionId") == "esoccer" and e.get("leagueId") == "gt-leagues"
@@ -272,25 +284,17 @@ def background_fetcher() -> None:
                 latest_raw.clear()
                 latest_raw.update(raw)
         except requests.exceptions.HTTPError as e:
-            if e.response is not None and e.response.status_code == 401:
-                log.warning("Fetcher got 401 – re‑authenticating…")
-                try:
-                    authenticate()
-                except Exception as auth_err:
-                    log.error("Fetcher re‑auth failed: %s", auth_err)
-                    time.sleep(5)
-            else:
-                log.error("Fetcher HTTP error: %s", e)
-                time.sleep(1)
+            log.error("Fetcher HTTP error: %s", e)
+            time.sleep(1)
         except Exception as e:
             log.error("Fetcher error: %s", e)
             time.sleep(1)
         time.sleep(FETCH_INTERVAL)
 
 # ============================================================
-# MATCH TRACKER (unchanged logic)
+# MATCH TRACKER
 # ============================================================
-active_matches = {}
+active_matches: Dict[int, Dict[str, Any]] = {}
 
 def compact_goal(minute, score, before, after):
     return (
@@ -316,7 +320,7 @@ def finalize_match(event_id, final_home, final_away):
     if state["goals"]:
         line += "|" + "|".join(state["goals"])
     writer.save_match(line)
-    log.info("saved %s vs %s", state["homeTeam"], state["awayTeam"])
+    log.info("saved %s vs %s", state['homeTeam'], state['awayTeam'])
 
 def tracker_loop():
     while not shutdown_event.is_set():
@@ -349,29 +353,53 @@ def tracker_loop():
                     "lastHome": home_score,
                     "lastAway": away_score,
                     "lastOdds": current_odds,
+                    "lastMinute": minute,
                     "goals": []
                 }
+                live_writer.start_match()
+                log.info("new match %s vs %s %s-%s minute %s",
+                         active_matches[event_id]["homeTeam"],
+                         active_matches[event_id]["awayTeam"],
+                         home_score, away_score, minute)
+                log_live_line(event, "START", minute, home_score, away_score, current_odds)
                 continue
 
             state = active_matches[event_id]
             old_home = state["lastHome"]
             old_away = state["lastAway"]
+            old_odds = state.get("lastOdds", {})
 
-            if old_home != home_score or old_away != away_score:
-                record = compact_goal(
-                    minute,
-                    f"{home_score}-{away_score}",
-                    state["lastOdds"],
-                    current_odds
+            score_changed = (old_home != home_score or old_away != away_score)
+            odds_changed_flag = odds_changed(old_odds, current_odds)
+
+            if score_changed or odds_changed_flag:
+                if score_changed:
+                    record = compact_goal(
+                        minute,
+                        f"{home_score}-{away_score}",
+                        state["lastOdds"],
+                        current_odds
+                    )
+                    state["goals"].append(record)
+                    log.info("goal %s vs %s %s", state["homeTeam"], state["awayTeam"], record)
+
+                event_type = (
+                    "GOAL" if score_changed and not odds_changed_flag else
+                    "ODDS" if odds_changed_flag and not score_changed else
+                    "GOAL_ODDS"
                 )
-                state["goals"].append(record)
-                log.info("goal %s vs %s %s", state["homeTeam"], state["awayTeam"], record)
+                extra_parts = []
+                if score_changed:
+                    extra_parts.append(f"score_change={old_home}-{old_away}->{home_score}-{away_score}")
+                if odds_changed_flag:
+                    extra_parts.append(f"odds_change={odds_str(old_odds)}->{odds_str(current_odds)}")
+                log_live_line(event, event_type, minute, home_score, away_score, current_odds, ";".join(extra_parts))
 
             state["lastHome"] = home_score
             state["lastAway"] = away_score
             state["lastOdds"] = current_odds
+            state["lastMinute"] = minute
 
-        # finished matches
         finished = [eid for eid in active_matches if eid not in current_ids]
         for event_id in finished:
             state = active_matches[event_id]
@@ -384,8 +412,8 @@ def tracker_loop():
 # MAIN
 # ============================================================
 def main():
-    #authenticate()
     log.info("GT League collector started")
+    log.info("Live log file: %s", live_writer.current_path())
 
     fetcher_thread = threading.Thread(target=background_fetcher, daemon=True)
     fetcher_thread.start()
@@ -393,7 +421,7 @@ def main():
     tracker_loop()
 
 # ============================================================
-# COMMAND‑LINE OVERRIDES
+# COMMAND-LINE OVERRIDES
 # ============================================================
 def parse_overrides():
     global USERNAME, PASSWORD, LOG_LEVEL
