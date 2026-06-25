@@ -1,4 +1,4 @@
-name: Run live.py sequentially for a week
+name: tester AI
 
 on:
   workflow_dispatch:
