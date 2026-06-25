@@ -1,0 +1,50 @@
+
+name: Collect Match Data
+
+on:
+  workflow_dispatch:
+  
+    # Every 4hours m
+  
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Create Data Folder
+        run: |
+          mkdir -p data
+
+      - name: Run Collector
+        run: |
+          timeout 4h python data.py
+
+      - name: Zip Dataset
+        if: always()
+        run: |
+          zip -r data.zip data
+
+      - name: Upload Zip
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: collected-data-${{ github.run_number }}
+          path: data.zip
+          retention-days: 30
+
