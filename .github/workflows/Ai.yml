@@ -5,8 +5,9 @@ on:
 
 # Cancel any previous run of THIS workflow immediately (extra safety)
 concurrency:
-  group: run-live-week
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
 
 permissions:
   actions: write          # required to cancel other workflow runs
