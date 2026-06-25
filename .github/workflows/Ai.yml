@@ -1,4 +1,4 @@
-name: tester AI
+name: tester AI 08035796220
 
 on:
   workflow_dispatch:
@@ -81,7 +81,7 @@ jobs:
       - name: Run live.py (6h max, timeout = success)
         run: |
           pip install requests
-          timeout 21600 python live.py
+          timeout 21600 python live.py  
           STATUS=$?
           if [ $STATUS -eq 124 ]; then
             echo "6‑hour timeout reached – exiting successfully"
