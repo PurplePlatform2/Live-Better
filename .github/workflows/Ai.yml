@@ -1,4 +1,4 @@
-name: tester AI 08035796220
+name: tester AI 08035796220 main
 
 on:
   workflow_dispatch:
