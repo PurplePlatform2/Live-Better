@@ -17,7 +17,7 @@ import requests
 # ------------------------------------------------------------------------------
 USERNAME: str = "08035796220"          # Default Betway username
 PASSWORD: str = "password"            # Default Betway password
-WAGER_AMOUNT: int = 9000                # Default stake in NGN
+WAGER_AMOUNT: int = 100                # Default stake in NGN
 IS_LIVE: bool = True                   # Actually place bets (False = dry run)
 ONE_TIME: bool = False                 # Exit after first successful bet
 LOG_LEVEL: str = "INFO"                # DEBUG / INFO / WARNING / ERROR
@@ -167,7 +167,6 @@ def _load_auth() -> Optional[Tuple[str, str]]:
         claims = decode_jwt(token) if token else {}
         exp = claims.get("exp")
         now = int(time.time())
-        # Accept only valid-looking, non-expired JWTs
         if token and brand and claims and (exp is None or int(exp) > now):
             return token, brand
     except Exception:
@@ -177,7 +176,6 @@ def _load_auth() -> Optional[Tuple[str, str]]:
 def authenticate(force_login: bool = False) -> Tuple[str, str]:
     global auth_token, brand_id
 
-    # 1. Try local file unless explicitly bypassed
     if not force_login:
         saved = _load_auth()
         if saved:
@@ -189,7 +187,6 @@ def authenticate(force_login: bool = False) -> Tuple[str, str]:
                 token_updated.set()
             return token, brand
 
-    # 2. Perform API login
     body = json.dumps({
         "username": USERNAME,
         "password": PASSWORD,
@@ -404,6 +401,19 @@ def post_bet(token: str, brand: str, payload: Dict[str, Any]) -> Tuple[bool, boo
     return False, False, None, "Unknown error"
 
 # ------------------------------------------------------------------------------
+# Helper: get current draw odds for an event
+# ------------------------------------------------------------------------------
+def get_draw_odds(raw: Dict[str, Any], event_id: int) -> Optional[float]:
+    """Return the decimal price for the Draw selection, or None if not found."""
+    try:
+        selection = build_selection(raw, event_id, "draw")
+        if selection and "price" in selection:
+            return float(selection["price"])
+    except Exception:
+        pass
+    return None
+
+# ------------------------------------------------------------------------------
 # Bet worker (retries + marking)
 # ------------------------------------------------------------------------------
 def bet_worker(event_id: int, pick: str, match_name: str, wager_amount: int) -> None:
@@ -505,7 +515,7 @@ def main() -> None:
             e for e in raw.get("events", [])
             if e.get("regionId") == "esoccer"
             and e.get("leagueId") == "gt-leagues"
-            and e.get("isActive", False)   # only active matches
+            and e.get("isActive", False)
         ]
 
         for event in gt_events:
@@ -520,33 +530,37 @@ def main() -> None:
 
             match_name = f"{event['homeTeam']} vs {event['awayTeam']}"
             goal_diff = abs(home_score - away_score)
+
+            # Wager amount is always fixed (no scaling)
             current_wager = WAGER_AMOUNT
 
-            # --- Condition: bet on winning team if time >= 10, diff >= 2, and odds == 1.01 ---
-            if elapsed_min >= 10 and goal_diff >= 2:
+            # --- Strategy 1: bet on winning team if elapsed >= 11 and diff >= 2 ---
+            if elapsed_min >= 11 and goal_diff >= 2:
                 pick = "home" if home_score > away_score else "away"
-
-                # Check odds before spawning a thread
-                selection = build_selection(raw, eid, pick)
-                if selection is None:
-                    continue
-                try:
-                    if float(selection["price"]) != 1.01:
-                        continue
-                except (ValueError, TypeError):
-                    continue
-
                 with progress_lock:
                     if eid in placed_bets or eid in betting_in_progress:
                         continue
                     betting_in_progress.add(eid)
-
                 t = threading.Thread(target=bet_worker, args=(eid, pick, match_name, current_wager), daemon=True)
                 t.start()
                 active_bet_threads.append(t)
+                continue
+
+            # --- Strategy 2: draw bet when time >= 10, score is draw and odds >= 2.0 ---
+            if elapsed_min >= 10 and home_score == away_score:
+                draw_odds = get_draw_odds(raw, eid)
+                if draw_odds is not None and draw_odds >= 2.0:
+                    with progress_lock:
+                        if eid in placed_bets or eid in betting_in_progress:
+                            continue
+                        betting_in_progress.add(eid)
+                    t = threading.Thread(target=bet_worker, args=(eid, "draw", match_name, current_wager), daemon=True)
+                    t.start()
+                    active_bet_threads.append(t)
 
         # Clean up finished threads
         active_bet_threads = [t for t in active_bet_threads if t.is_alive()]
+
         time.sleep(0.5)
 
     log.info("Bot shutdown requested. Waiting for active bet threads...")
@@ -555,11 +569,11 @@ def main() -> None:
     log.info("Bot stopped cleanly.")
 
 # ------------------------------------------------------------------------------
-# Command‑line overrides
+# Command‑line overrides (including wager, username, password)
 # ------------------------------------------------------------------------------
 def parse_overrides() -> None:
     global IS_LIVE, ONE_TIME, LOG_LEVEL, WAGER_AMOUNT, USERNAME, PASSWORD
-    parser = argparse.ArgumentParser(description="Betway GT League Bot (goal diff + odds 1.01)")
+    parser = argparse.ArgumentParser(description="Betway GT League Bot (goal diff / draw odds)")
     parser.add_argument("--live", action="store_true", default=None,
                         help="Enable live betting (otherwise dry run)")
     parser.add_argument("--one-time", action="store_true", default=None,
