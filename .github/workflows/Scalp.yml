@@ -1,0 +1,137 @@
+name: Full Betwgb Scraper (MHTML + API + Network Logs)
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install Puppeteer
+        run: |
+          npm init -y
+          npm install puppeteer
+
+      - name: Run Full Browser Scrape
+        run: |
+          node <<'EOF'
+          const fs = require('fs');
+          const puppeteer = require('puppeteer');
+
+          (async () => {
+            const browser = await puppeteer.launch({
+              headless: "new",
+              args: ["--no-sandbox", "--disable-setuid-sandbox"]
+            });
+
+            const page = await browser.newPage();
+
+            const apiResults = [];
+            const networkLogs = [];
+
+            // ===== CAPTURE REQUESTS =====
+            page.on('request', (request) => {
+              networkLogs.push({
+                type: 'request',
+                url: request.url(),
+                method: request.method(),
+                headers: request.headers(),
+                timestamp: new Date().toISOString()
+              });
+            });
+
+            // ===== CAPTURE RESPONSES =====
+            page.on('response', async (response) => {
+              try {
+                const request = response.request();
+                const headers = response.headers();
+                const url = response.url();
+                const status = response.status();
+
+                let body = null;
+
+                try {
+                  body = await response.text();
+                } catch (e) {}
+
+                // Save full network log
+                networkLogs.push({
+                  type: 'response',
+                  url,
+                  status,
+                  headers,
+                  method: request.method(),
+                  timestamp: new Date().toISOString()
+                });
+
+                // Capture API JSON separately
+                if (
+                  headers['content-type'] &&
+                  headers['content-type'].includes('application/json')
+                ) {
+                  apiResults.push({
+                    url,
+                    status,
+                    data: body
+                  });
+                }
+
+              } catch (e) {}
+            });
+
+            await page.goto("https://www.betwgb.com/sport-prematch?sport=Football", {
+              waitUntil: "networkidle2",
+              timeout: 0
+            });
+
+            // Extra wait for dynamic odds loading
+            await new Promise(r => setTimeout(r, 8000));
+
+            // ===== SAVE MHTML =====
+            const client = await page.target().createCDPSession();
+            const { data } = await client.send('Page.captureSnapshot', {
+              format: 'mhtml'
+            });
+
+            fs.writeFileSync('betway.mhtml', data);
+
+            // ===== SAVE API DATA =====
+            fs.writeFileSync(
+              'betway_api.json',
+              JSON.stringify(apiResults, null, 2)
+            );
+
+            // ===== SAVE NETWORK LOGS =====
+            fs.writeFileSync(
+              'network_logs.json',
+              JSON.stringify(networkLogs, null, 2)
+            );
+
+            await browser.close();
+          })();
+          EOF
+
+      - name: Upload MHTML
+        uses: actions/upload-artifact@v4
+        with:
+          name: betway-mhtml
+          path: betway.mhtml
+
+      - name: Upload API Data
+        uses: actions/upload-artifact@v4
+        with:
+          name: betway-api
+          path: betway_api.json
+
+      - name: Upload Network Logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: betway-network-logs
+          path: network_logs.json
