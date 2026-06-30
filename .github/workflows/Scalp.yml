@@ -86,7 +86,7 @@ jobs:
               } catch (e) {}
             });
 
-            await page.goto("https://www.betwgb.com/sport-prematch?sport=Football", {
+            await page.goto("https://www.betway.com.ng/event/soccer/esoccer/gt-leagues/congo-dr-furious-france-ultrex?eventId=72411692&fixtureType=live", {
               waitUntil: "networkidle2",
               timeout: 0
             });
