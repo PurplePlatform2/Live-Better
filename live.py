@@ -488,7 +488,7 @@ def main() -> None:
 
             match_name = f"{event['homeTeam']} vs {event['awayTeam']}"
 
-            if elapsed_min > 11:
+            if elapsed_min >= 11:
                 with window_lock:
                     state = window_state.get(eid)
 
