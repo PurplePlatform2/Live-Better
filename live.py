@@ -9,22 +9,17 @@ import logging
 import threading
 import sys
 import argparse
+import traceback
 from typing import Dict, Optional, Any, Tuple, List
 
 import requests
 
-# ------------------------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------------------------
 USERNAME: str = "08035796220"
 PASSWORD: str = "password"
-WAGER_AMOUNT: int = 101                # stake in NGN
-WINDOW_SECONDS: int = 51               # real‑time window after reaching 11'
+WAGER_AMOUNT: int = 102
+WINDOW_SECONDS: int = 51
 MAX_RETRIES: int = 3
 
-# ------------------------------------------------------------------------------
-# API endpoints
-# ------------------------------------------------------------------------------
 AUTH_URL: str = "https://www.betway.com.ng/appsynapse/auth/users/authenticate"
 LIVE_URL: str = "https://feeds-roa2.betwayafrica.com/br/_apis/sport/v1/BetBook/LiveInPlay/"
 STRIKE_URL: str = "https://www.betway.com.ng/appsynapse/bet-api-sr02/v2/Betting/Strike"
@@ -35,9 +30,6 @@ HEADERS: Dict[str, str] = {
     "Origin": "https://www.betway.com.ng",
 }
 
-# ------------------------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -46,9 +38,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("betway_bot")
 
-# ------------------------------------------------------------------------------
-# Shared state
-# ------------------------------------------------------------------------------
 latest_raw: Dict[str, Any] = {}
 data_lock = threading.Lock()
 
@@ -63,16 +52,11 @@ progress_lock = threading.Lock()
 
 shutdown_event = threading.Event()
 
-# Timer state for each match that has started its 51‑second window
-# event_id -> { "start_time": float, "goal_seen": bool, "baseline_home": int, "baseline_away": int }
 window_state: Dict[int, Dict[str, Any]] = {}
 window_lock = threading.Lock()
 
 AUTH_FILE = "auth.txt"
 
-# ------------------------------------------------------------------------------
-# Utilities (unchanged)
-# ------------------------------------------------------------------------------
 def generate_uuid() -> str:
     return str(uuid.uuid4())
 
@@ -143,9 +127,6 @@ def parse_bet_response(data_obj: Dict[str, Any]) -> Tuple[bool, bool, Optional[s
                 error_messages.append(f"placementStatus={placement}")
     return (True, False, None) if success else (False, hidden, "; ".join(error_messages))
 
-# ------------------------------------------------------------------------------
-# Authentication (unchanged)
-# ------------------------------------------------------------------------------
 def _save_auth(token: str, brand: str) -> None:
     try:
         with open(AUTH_FILE, "w") as f:
@@ -212,9 +193,6 @@ def authenticate(force_login: bool = False) -> Tuple[str, str]:
         token_updated.set()
     return token, brand
 
-# ------------------------------------------------------------------------------
-# Background fetcher (unchanged)
-# ------------------------------------------------------------------------------
 def fetch_live_data(token: str) -> Optional[Dict[str, Any]]:
     params = {
         "countryCode": "NG",
@@ -267,9 +245,6 @@ def background_fetcher() -> None:
             log.error("Fetcher error: %s", e)
             time.sleep(1)
 
-# ------------------------------------------------------------------------------
-# Selection & payload (unchanged)
-# ------------------------------------------------------------------------------
 def build_selection(raw: Dict[str, Any], event_id: int, pick: str) -> Optional[Dict[str, Any]]:
     events = {e["eventId"]: e for e in raw.get("events", [])}
     prices_map = {p["outcomeId"]: p for p in raw.get("prices", [])}
@@ -395,9 +370,6 @@ def post_bet(token: str, brand: str, payload: Dict[str, Any]) -> Tuple[bool, boo
         return False, False, None, str(e)
     return False, False, None, "Unknown error"
 
-# ------------------------------------------------------------------------------
-# Bet worker – same as before, but now respects ONE_TIME flag
-# ------------------------------------------------------------------------------
 def bet_worker(event_id: int, pick: str, match_name: str, wager_amount: int) -> None:
     retries = 0
     log.info("Thread for match %d (%s) – betting on %s with stake %d NGN",
@@ -470,9 +442,6 @@ def bet_worker(event_id: int, pick: str, match_name: str, wager_amount: int) -> 
             betting_in_progress.discard(event_id)
             placed_bets.add(event_id)
 
-# ------------------------------------------------------------------------------
-# Main loop – NEW strategy: 51‑second window after 11', bet only if goal occurs
-# ------------------------------------------------------------------------------
 def main() -> None:
     log.info("Bot starting. Wager = %d NGN, Window = %d seconds. One-time = %s",
              WAGER_AMOUNT, WINDOW_SECONDS, ONE_TIME)
@@ -487,7 +456,6 @@ def main() -> None:
         with data_lock:
             raw = dict(latest_raw)
 
-        # Only GT League e‑soccer matches
         gt_events = [
             e for e in raw.get("events", [])
             if e.get("regionId") == "esoccer"
@@ -497,7 +465,6 @@ def main() -> None:
 
         current_ids = {ev["eventId"] for ev in gt_events}
 
-        # Remove window state for matches that are no longer active
         with window_lock:
             for eid in list(window_state.keys()):
                 if eid not in current_ids:
@@ -506,7 +473,6 @@ def main() -> None:
         for event in gt_events:
             eid = event["eventId"]
 
-            # Skip if already bet / being bet on
             with progress_lock:
                 if eid in placed_bets or eid in betting_in_progress:
                     continue
@@ -522,19 +488,11 @@ def main() -> None:
 
             match_name = f"{event['homeTeam']} vs {event['awayTeam']}"
 
-            # ------------------------------------------------------------
-            # Strategy:
-            # 1. When game time first exceeds 11', start the 51‑second window
-            #    and record the current score as baseline.
-            # 2. During the window, if the score changes → goal_during = True
-            # 3. After 51 s, if goal_during is True → place bet.
-            # ------------------------------------------------------------
             if elapsed_min > 11:
                 with window_lock:
                     state = window_state.get(eid)
 
                     if state is None:
-                        # First time we see this match past 11' – start the window
                         window_state[eid] = {
                             "start_time": time.time(),
                             "goal_seen": False,
@@ -543,25 +501,20 @@ def main() -> None:
                         }
                         log.info("⏱️  Started 51‑sec window for %s at game time %.2f (score %d-%d)",
                                  match_name, elapsed_min, home_score, away_score)
-                        continue  # wait for next iteration
+                        continue
 
-                    # Window already active
                     elapsed_real = time.time() - state["start_time"]
 
-                    # Check if a goal has been scored since the window started
                     if not state["goal_seen"]:
                         if home_score != state["baseline_home"] or away_score != state["baseline_away"]:
                             state["goal_seen"] = True
                             log.info("⚽ Goal detected in window! %s new score %d-%d",
                                      match_name, home_score, away_score)
 
-                    # If window still running, just continue waiting
                     if elapsed_real < WINDOW_SECONDS:
                         continue
 
-                    # Window expired
                     if state["goal_seen"]:
-                        # Decide bet based on current score
                         if home_score > away_score:
                             pick = "home"
                         elif away_score > home_score:
@@ -569,10 +522,8 @@ def main() -> None:
                         else:
                             pick = "draw"
 
-                        # Remove window state so it doesn't fire again
                         del window_state[eid]
 
-                        # Double-check not already bet
                         with progress_lock:
                             if eid in placed_bets or eid in betting_in_progress:
                                 continue
@@ -586,11 +537,11 @@ def main() -> None:
                         log.info("🚀 Bet dispatched for %s (pick=%s) after window expired",
                                  match_name, pick)
                     else:
-                        # No goal occurred – window ends with no bet
                         del window_state[eid]
                         log.info("❌ Window expired for %s with no goal – no bet placed.", match_name)
+                        with progress_lock:
+                            placed_bets.add(eid)
 
-        # Clean up finished threads
         active_bet_threads = [t for t in active_bet_threads if t.is_alive()]
         time.sleep(0.5)
 
@@ -599,9 +550,6 @@ def main() -> None:
         t.join(timeout=5)
     log.info("Bot stopped cleanly.")
 
-# ------------------------------------------------------------------------------
-# Command‑line overrides
-# ------------------------------------------------------------------------------
 ONE_TIME: bool = False
 
 def parse_overrides() -> None:
@@ -625,6 +573,7 @@ def parse_overrides() -> None:
         USERNAME = args.username
     if args.password is not None:
         PASSWORD = args.password
+    global ONE_TIME
     if args.one_time:
         ONE_TIME = True
 
