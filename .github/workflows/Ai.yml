@@ -1,12 +1,11 @@
 name: tester AI 08035796220 v8New
 
 on:
-  workflow_dispatch:
-
+  workflow_diprevious
 # Cancel any previous run of THIS workflow immediately (extra safety)
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+#concurrency:
+#  group: ${{ github.workflow }}-${{ github.ref }}
+#  cancel-in-progress: true
 
 
 permissions:
