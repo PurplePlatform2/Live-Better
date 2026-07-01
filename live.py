@@ -17,7 +17,7 @@ import requests
 # ------------------------------------------------------------------------------
 USERNAME: str = "08035796220"          # Default Betway username
 PASSWORD: str = "password"            # Default Betway password
-WAGER_AMOUNT: int = 100                # Default stake in NGN
+WAGER_AMOUNT: int = 500                # Default stake in NGN
 IS_LIVE: bool = True                   # Actually place bets (False = dry run)
 ONE_TIME: bool = False                 # Exit after first successful bet
 LOG_LEVEL: str = "INFO"                # DEBUG / INFO / WARNING / ERROR
@@ -549,7 +549,7 @@ def main() -> None:
             # --- Strategy 2: draw bet when time >= 10, score is draw and odds >= 2.0 ---
             if elapsed_min >= 10 and home_score == away_score:
                 draw_odds = get_draw_odds(raw, eid)
-                if draw_odds is not None and draw_odds >= 2.0:
+                if draw_odds is not None and draw_odds >= 4.0:
                     with progress_lock:
                         if eid in placed_bets or eid in betting_in_progress:
                             continue
