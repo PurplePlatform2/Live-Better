@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-"""
-Betway GT League Bot – “Goal‑In‑Window” Strategy (FIXED)
-=========================================================
-When a match reaches game time > 11 minutes, start a 51‑second real‑time clock.
-If a goal is scored DURING those 51 seconds, bet on the current winning team
-(or Draw) once the clock runs out.  If no goal happens, do nothing.
-
-Usage:
-  python live.py --username myUsername --password myPassword [--one-time] [--wager 200]
-"""
-
 
 import os
 import time
