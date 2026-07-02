@@ -16,7 +16,7 @@ import requests
 USERNAME: str = "08035796220"
 PASSWORD: str = "password"
 WAGER_AMOUNT: int = 102
-WINDOW_SECONDS: int = 51
+WINDOW_SECONDS: int = 58
 MAX_RETRIES: int = 3
 
 AUTH_URL: str = "https://www.betway.com.ng/appsynapse/auth/users/authenticate"
