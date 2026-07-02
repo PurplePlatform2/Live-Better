@@ -14,9 +14,9 @@ from typing import Dict, Optional, Any, Tuple, List
 
 import requests
 
-USERNAME: str = "08109995000"
-PASSWORD: str = "passwords"
-WAGER_AMOUNT: int = 100
+USERNAME: str = "08035796220"
+PASSWORD: str = "password"
+WAGER_AMOUNT: int = 1000
 MAX_RETRIES: int = 3
 
 AUTH_URL: str = "https://www.betway.com.ng/appsynapse/auth/users/authenticate"
