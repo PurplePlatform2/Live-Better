@@ -15,7 +15,7 @@ import requests
 
 USERNAME: str = "08035796220"
 PASSWORD: str = "password"
-WAGER_AMOUNT: int = 102
+WAGER_AMOUNT: int = 103
 WINDOW_SECONDS: int = 58
 MAX_RETRIES: int = 3
 
