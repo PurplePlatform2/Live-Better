@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+"""
+Betway GT League Bot – “Goal‑In‑Window” Strategy (FIXED)
+=========================================================
+When a match reaches game time > 11 minutes, start a 51‑second real‑time clock.
+If a goal is scored DURING those 51 seconds, bet on the current winning team
+(or Draw) once the clock runs out.  If no goal happens, do nothing.
+
+Usage:
+  python live.py --username myUsername --password myPassword [--one-time] [--wager 200]
+"""
+
 
 import os
 import time
@@ -122,7 +133,7 @@ def parse_bet_response(data_obj: Dict[str, Any]) -> Tuple[bool, bool, Optional[s
             if error_code == 100001 or _is_hidden_error(msg):
                 hidden = True
         else:
-            if placement != "Accepted":
+            if placement not in ("Accepted", "Success"):
                 success = False
                 error_messages.append(f"placementStatus={placement}")
     return (True, False, None) if success else (False, hidden, "; ".join(error_messages))
@@ -370,10 +381,10 @@ def post_bet(token: str, brand: str, payload: Dict[str, Any]) -> Tuple[bool, boo
         return False, False, None, str(e)
     return False, False, None, "Unknown error"
 
-def bet_worker(event_id: int, pick: str, match_name: str, wager_amount: int) -> None:
+def bet_worker(event_id: int, match_name: str, wager_amount: int) -> None:
     retries = 0
-    log.info("Thread for match %d (%s) – betting on %s with stake %d NGN",
-             event_id, match_name, pick, wager_amount)
+    log.info("Thread for match %d (%s) – preparing bet with stake %d NGN",
+             event_id, match_name, wager_amount)
 
     try:
         while retries <= MAX_RETRIES and not shutdown_event.is_set():
@@ -388,6 +399,21 @@ def bet_worker(event_id: int, pick: str, match_name: str, wager_amount: int) -> 
             if not event_bet or not event_bet.get("isActive", False):
                 log.warning("Match %d gone/inactive – giving up", event_id)
                 break
+
+            gs = event_bet.get("gameStateTimeScore", {})
+            home_score, away_score = get_score(gs)
+            if home_score is None or away_score is None:
+                log.warning("Could not get score for %d – retrying", event_id)
+                retries += 1
+                continue
+
+            # Decide pick based on CURRENT score (most recent feed data)
+            if home_score > away_score:
+                pick = "home"
+            elif away_score > home_score:
+                pick = "away"
+            else:
+                pick = "draw"
 
             selection = build_selection(raw_bet, event_id, pick)
             if not selection:
@@ -407,7 +433,8 @@ def bet_worker(event_id: int, pick: str, match_name: str, wager_amount: int) -> 
                     first_resp = resp_data.get("betResponses", [{}])[0]
                     betslip = first_resp.get("betslipId")
                     booking = first_resp.get("bookingCode")
-                    log.info("✅ Bet placed successfully! Betslip: %s, Booking: %s", betslip, booking)
+                    log.info("✅ Bet placed successfully! Betslip: %s, Booking: %s  (pick=%s, score %d-%d)",
+                             betslip, booking, pick, home_score, away_score)
                 except Exception:
                     log.info("✅ Bet placed successfully! Response: %s", resp_data)
 
@@ -515,13 +542,6 @@ def main() -> None:
                         continue
 
                     if state["goal_seen"]:
-                        if home_score > away_score:
-                            pick = "home"
-                        elif away_score > home_score:
-                            pick = "away"
-                        else:
-                            pick = "draw"
-
                         del window_state[eid]
 
                         with progress_lock:
@@ -529,13 +549,13 @@ def main() -> None:
                                 continue
                             betting_in_progress.add(eid)
 
+                        # Pass no pick – the worker decides from the latest score
                         t = threading.Thread(target=bet_worker,
-                                             args=(eid, pick, match_name, WAGER_AMOUNT),
+                                             args=(eid, match_name, WAGER_AMOUNT),
                                              daemon=True)
                         t.start()
                         active_bet_threads.append(t)
-                        log.info("🚀 Bet dispatched for %s (pick=%s) after window expired",
-                                 match_name, pick)
+                        log.info("🚀 Bet dispatched for %s after window expired", match_name)
                     else:
                         del window_state[eid]
                         log.info("❌ Window expired for %s with no goal – no bet placed.", match_name)
