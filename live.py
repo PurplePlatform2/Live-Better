@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+
 import os
 import time
 import json
@@ -14,11 +15,14 @@ from typing import Dict, Optional, Any, Tuple, List
 
 import requests
 
+# ---------- configuration ----------
 USERNAME: str = "08035796220"
 PASSWORD: str = "password"
-WAGER_AMOUNT: int = 1000
+WAGER_AMOUNT: int = 102          # stake in NGN
+WINDOW_SECONDS: int = 50         # timer length after game time ≥ 11 min
 MAX_RETRIES: int = 3
 
+# ---------- API endpoints ----------
 AUTH_URL: str = "https://www.betway.com.ng/appsynapse/auth/users/authenticate"
 LIVE_URL: str = "https://feeds-roa2.betwayafrica.com/br/_apis/sport/v1/BetBook/LiveInPlay/"
 STRIKE_URL: str = "https://www.betway.com.ng/appsynapse/bet-api-sr02/v2/Betting/Strike"
@@ -35,8 +39,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     stream=sys.stdout,
 )
-log = logging.getLogger("betway_bot")
+log = logging.getLogger("betway_draw_bot")
 
+# ---------- global state ----------
 latest_raw: Dict[str, Any] = {}
 data_lock = threading.Lock()
 
@@ -45,19 +50,19 @@ brand_id: str = ""
 auth_lock = threading.Lock()
 token_updated = threading.Event()
 
-# Flags for the Win‑By‑Two strategy
 placed_bets: set[int] = set()
 betting_in_progress: set[int] = set()
 progress_lock = threading.Lock()
 
-# Post‑entry monitoring data
-entry_monitor: Dict[int, Dict[str, Any]] = {}
-entry_lock = threading.Lock()
-
 shutdown_event = threading.Event()
+
+# window state for the two‑phase logic
+window_state: Dict[int, Dict[str, Any]] = {}
+window_lock = threading.Lock()
 
 AUTH_FILE = "auth.txt"
 
+# ----------------------------------------------------------------------
 def generate_uuid() -> str:
     return str(uuid.uuid4())
 
@@ -371,15 +376,10 @@ def post_bet(token: str, brand: str, payload: Dict[str, Any]) -> Tuple[bool, boo
         return False, False, None, str(e)
     return False, False, None, "Unknown error"
 
-def bet_worker(event_id: int, match_name: str, wager_amount: int, force_pick: Optional[str] = None) -> None:
-    """
-    Places a bet. If *force_pick* is given ("home", "away", "draw") it is used
-    regardless of the current live score. Otherwise the pick is decided from the
-    latest score.
-    """
+def bet_worker(event_id: int, match_name: str, wager_amount: int, pick: str = "draw") -> None:
     retries = 0
-    log.info("Thread for match %d (%s) – preparing bet with stake %d NGN (force_pick=%s)",
-             event_id, match_name, wager_amount, force_pick)
+    log.info("Thread for match %d (%s) – placing DRAW bet with stake %d NGN",
+             event_id, match_name, wager_amount)
 
     try:
         while retries <= MAX_RETRIES and not shutdown_event.is_set():
@@ -394,23 +394,6 @@ def bet_worker(event_id: int, match_name: str, wager_amount: int, force_pick: Op
             if not event_bet or not event_bet.get("isActive", False):
                 log.warning("Match %d gone/inactive – giving up", event_id)
                 break
-
-            gs = event_bet.get("gameStateTimeScore", {})
-            home_score, away_score = get_score(gs)
-            if home_score is None or away_score is None:
-                log.warning("Could not get score for %d – retrying", event_id)
-                retries += 1
-                continue
-
-            if force_pick:
-                pick = force_pick
-            else:
-                if home_score > away_score:
-                    pick = "home"
-                elif away_score > home_score:
-                    pick = "away"
-                else:
-                    pick = "draw"
 
             selection = build_selection(raw_bet, event_id, pick)
             if not selection:
@@ -430,10 +413,10 @@ def bet_worker(event_id: int, match_name: str, wager_amount: int, force_pick: Op
                     first_resp = resp_data.get("betResponses", [{}])[0]
                     betslip = first_resp.get("betslipId")
                     booking = first_resp.get("bookingCode")
-                    log.info("✅ Bet placed successfully! Betslip: %s, Booking: %s  (pick=%s, score %d-%d)",
-                             betslip, booking, pick, home_score, away_score)
+                    log.info("✅ DRAW bet placed! Betslip: %s, Booking: %s  (match %s)",
+                             betslip, booking, match_name)
                 except Exception:
-                    log.info("✅ Bet placed successfully! Response: %s", resp_data)
+                    log.info("✅ DRAW bet placed! Response: %s", resp_data)
 
                 if ONE_TIME:
                     log.info("One-time mode – stopping after this bet.")
@@ -467,10 +450,8 @@ def bet_worker(event_id: int, match_name: str, wager_amount: int, force_pick: Op
             placed_bets.add(event_id)
 
 def main() -> None:
-    global WAGER_AMOUNT
-
-    log.info("Bot starting. Win‑By‑Two strategy wager = %d NGN. One-time = %s",
-             WAGER_AMOUNT, ONE_TIME)
+    log.info("Draw‑After‑Goal (goal AFTER timer) Bot starting. Wager = %d NGN, Timer = %d s. One-time = %s",
+             WAGER_AMOUNT, WINDOW_SECONDS, ONE_TIME)
 
     authenticate(force_login=False)
     fetcher_thread = threading.Thread(target=background_fetcher, daemon=True)
@@ -491,9 +472,18 @@ def main() -> None:
 
         current_ids = {ev["eventId"] for ev in gt_events}
 
-        # --- Strategy: Win‑By‑Two ---
+        with window_lock:
+            # remove state for matches no longer present
+            for eid in list(window_state.keys()):
+                if eid not in current_ids:
+                    del window_state[eid]
+
         for event in gt_events:
             eid = event["eventId"]
+
+            with progress_lock:
+                if eid in placed_bets or eid in betting_in_progress:
+                    continue
 
             gs = event.get("gameStateTimeScore", {})
             elapsed_min = gs.get("time")
@@ -506,75 +496,77 @@ def main() -> None:
 
             match_name = f"{event['homeTeam']} vs {event['awayTeam']}"
 
-            with progress_lock:
-                can_bet = (eid not in placed_bets and eid not in betting_in_progress)
+            # ----- Phase 1: start timer at game time >= 11 min -----
+            if elapsed_min >= 11:
+                with window_lock:
+                    state = window_state.get(eid)
 
-            if can_bet and elapsed_min >= 11:
-                diff = abs(home_score - away_score)
-                if diff >= 2:
-                    if home_score > away_score:
-                        pick = "home"
-                    else:
-                        pick = "away"
-
-                    with progress_lock:
-                        betting_in_progress.add(eid)
-
-                    # Register for post‑entry goal monitoring
-                    with entry_lock:
-                        entry_monitor[eid] = {
-                            "entry_time": time.time(),
-                            "home_score": home_score,
-                            "away_score": away_score,
-                            "match_name": match_name,
+                    if state is None:
+                        # first time – create timer state, ignore score until timer expires
+                        window_state[eid] = {
+                            "phase": "timer",
+                            "start_time": time.time(),
+                            "baseline_home": home_score,
+                            "baseline_away": away_score,  # not used, just recorded
                         }
+                        log.info("⏱️  Started 50‑s timer for %s (score %d-%d)",
+                                 match_name, home_score, away_score)
+                        continue
 
-                    t = threading.Thread(target=bet_worker,
-                                         args=(eid, match_name, WAGER_AMOUNT, pick),
-                                         daemon=True)
-                    t.start()
-                    active_bet_threads.append(t)
-                    log.info("🚀 Win‑by‑two bet dispatched for %s (pick=%s, diff=%d)",
-                             match_name, pick, diff)
+                    if state["phase"] == "timer":
+                        elapsed_real = time.time() - state["start_time"]
+                        if elapsed_real < WINDOW_SECONDS:
+                            # still in timer – do nothing, just wait
+                            continue
+                        else:
+                            # timer expired → switch to monitoring phase
+                            log.info("⏰ Timer ended for %s – now watching for a goal that makes it a draw",
+                                     match_name)
+                            state["phase"] = "monitor"
+                            # record the score at the moment the timer expires as the new baseline
+                            state["post_timer_baseline_home"] = home_score
+                            state["post_timer_baseline_away"] = away_score
+                            continue
 
-        # --- Post‑entry Goal Monitoring ---
-        with entry_lock:
-            monitored = list(entry_monitor.items())
+                    elif state["phase"] == "monitor":
+                        # post‑timer: check for a goal that results in a draw
+                        baseline_home = state["post_timer_baseline_home"]
+                        baseline_away = state["post_timer_baseline_away"]
+                        if home_score == baseline_home and away_score == baseline_away:
+                            # no goal yet – keep waiting
+                            continue
 
-        for eid, info in monitored:
-            # Stop monitoring if match is no longer in the feed
-            if eid not in current_ids:
-                with entry_lock:
-                    if eid in entry_monitor:
-                        del entry_monitor[eid]
-                log.info("🏁 Match ended (removed from feed): %s", info["match_name"])
-                continue
+                        # a goal has occurred (score changed)
+                        log.info("⚽ Goal detected AFTER timer! %s new score %d-%d",
+                                 match_name, home_score, away_score)
 
-            # Find the event data for this eid
-            event_data = next((e for e in gt_events if e["eventId"] == eid), None)
-            if not event_data or not event_data.get("isActive", False):
-                with entry_lock:
-                    if eid in entry_monitor:
-                        del entry_monitor[eid]
-                log.info("🏁 Match no longer active: %s", info["match_name"])
-                continue
+                        if home_score == away_score:
+                            # it's a draw → place bet
+                            with progress_lock:
+                                if eid in placed_bets or eid in betting_in_progress:
+                                    del window_state[eid]
+                                    continue
+                                betting_in_progress.add(eid)
 
-            gs = event_data.get("gameStateTimeScore", {})
-            new_home, new_away = get_score(gs)
-            if new_home is None or new_away is None:
-                continue
+                            t = threading.Thread(target=bet_worker,
+                                                 args=(eid, match_name, WAGER_AMOUNT, "draw"),
+                                                 daemon=True)
+                            t.start()
+                            active_bet_threads.append(t)
+                            log.info("🚀 Draw bet dispatched for %s (score %d-%d)",
+                                     match_name, home_score, away_score)
+                            # mark as processed
+                            with progress_lock:
+                                placed_bets.add(eid)
+                            del window_state[eid]
+                        else:
+                            # goal but not a draw – stop monitoring this match
+                            log.info("❌ Goal after timer but not a draw (%d-%d) – no bet for %s",
+                                     home_score, away_score, match_name)
+                            with progress_lock:
+                                placed_bets.add(eid)
+                            del window_state[eid]
 
-            if (new_home != info["home_score"]) or (new_away != info["away_score"]):
-                elapsed = time.time() - info["entry_time"]
-                log.info("⚽ Goal after entry: %s – new score %d‑%d (%.1f seconds after entry)",
-                         info["match_name"], new_home, new_away, elapsed)
-                # Update stored scores
-                with entry_lock:
-                    if eid in entry_monitor:
-                        entry_monitor[eid]["home_score"] = new_home
-                        entry_monitor[eid]["away_score"] = new_away
-
-        # Cleanup finished threads
         active_bet_threads = [t for t in active_bet_threads if t.is_alive()]
         time.sleep(0.5)
 
@@ -588,10 +580,10 @@ ONE_TIME: bool = False
 def parse_overrides() -> None:
     global WAGER_AMOUNT, USERNAME, PASSWORD, ONE_TIME
     parser = argparse.ArgumentParser(
-        description="Betway GT League Bot – Win‑By‑Two Strategy"
+        description="Betway GT League Draw‑After‑Goal Bot (goal AFTER timer)"
     )
     parser.add_argument("--wager", type=int, default=None,
-                        help="Stake amount for the bet (NGN)")
+                        help="Stake amount in NGN")
     parser.add_argument("--username", type=str, default=None,
                         help="Betway username")
     parser.add_argument("--password", type=str, default=None,
@@ -606,6 +598,7 @@ def parse_overrides() -> None:
         USERNAME = args.username
     if args.password is not None:
         PASSWORD = args.password
+    global ONE_TIME
     if args.one_time:
         ONE_TIME = True
 
