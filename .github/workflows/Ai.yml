@@ -71,7 +71,6 @@ jobs:
   run1:
     needs: cancel-others
     runs-on: ubuntu-latest
-    timeout-minutes: 425
     steps:
       - uses: actions/checkout@v4
 
@@ -83,7 +82,7 @@ jobs:
         shell: bash
         run: |
           pip install requests
-          timeout --signal=SIGTERM 21600 python live.py
+          timeout --signal=SIGTERM 21000 python live.py
           STATUS=$?
           if [ $STATUS -eq 124 ]; then
             echo "6-hour timeout reached - exiting successfully"
@@ -102,7 +101,6 @@ jobs:
   run2:
     needs: run1
     runs-on: ubuntu-latest
-    timeout-minutes: 425
     steps:
       - uses: actions/checkout@v4
 
@@ -121,7 +119,7 @@ jobs:
         shell: bash
         run: |
           pip install requests
-          timeout --signal=SIGTERM 21600 python live.py
+          timeout --signal=SIGTERM 21000 python live.py
           STATUS=$?
           if [ $STATUS -eq 124 ]; then
             echo "6-hour timeout reached - exiting successfully"
@@ -140,7 +138,7 @@ jobs:
   run3:
     needs: run2
     runs-on: ubuntu-latest
-    timeout-minutes: 425
+    
     steps:
       - uses: actions/checkout@v4
 
@@ -159,7 +157,7 @@ jobs:
         shell: bash
         run: |
           pip install requests
-          timeout --signal=SIGTERM 21600 python live.py
+          timeout --signal=SIGTERM 21000 python live.py
           STATUS=$?
           if [ $STATUS -eq 124 ]; then
             echo "6-hour timeout reached - exiting successfully"
@@ -178,7 +176,7 @@ jobs:
   run4:
     needs: run3
     runs-on: ubuntu-latest
-    timeout-minutes: 425
+  
     steps:
       - uses: actions/checkout@v4
 
@@ -197,7 +195,7 @@ jobs:
         shell: bash
         run: |
           pip install requests
-          timeout --signal=SIGTERM 21600 python live.py
+          timeout --signal=SIGTERM 21000 python live.py
           STATUS=$?
           if [ $STATUS -eq 124 ]; then
             echo "6-hour timeout reached - exiting successfully"
