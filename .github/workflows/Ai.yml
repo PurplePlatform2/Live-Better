@@ -68,148 +68,147 @@ jobs:
   # ──────────────────────────────────────────────────
   #  JOB 1 – starts with default auth.txt from repo
   # ──────────────────────────────────────────────────
-   run1:
-  needs: cancel-others
-  runs-on: ubuntu-latest
-  timeout-minutes: 425
-  steps:
-    - uses: actions/checkout@v4
+  run1:
+    needs: cancel-others
+    runs-on: ubuntu-latest
+    timeout-minutes: 425
+    steps:
+      - uses: actions/checkout@v4
 
-    - uses: actions/setup-python@v5
-      with:
-        python-version: "3.12"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-    - name: Run live.py (6h max, timeout = success)
-      shell: bash
-      run: |
-        pip install requests
-        timeout --signal=SIGTERM 21600 python live.py
-        STATUS=$?
-        if [ $STATUS -eq 124 ]; then
-          echo "6-hour timeout reached - exiting successfully"
-          exit 0
-        else
-          exit $STATUS
-        fi
+      - name: Run live.py (6h max, timeout = success)
+        shell: bash
+        run: |
+          pip install requests
+          timeout --signal=SIGTERM 21600 python live.py
+          STATUS=$?
+          if [ $STATUS -eq 124 ]; then
+            echo "6-hour timeout reached - exiting successfully"
+            exit 0
+          else
+            exit $STATUS
+          fi
 
-    - name: Upload auth artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: auth-run1
-        path: auth.txt
-        retention-days: 1
+      - name: Upload auth artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: auth-run1
+          path: auth.txt
+          retention-days: 1
 
-run2:
-  needs: run1
-  runs-on: ubuntu-latest
-  timeout-minutes: 425
-  steps:
-    - uses: actions/checkout@v4
+  run2:
+    needs: run1
+    runs-on: ubuntu-latest
+    timeout-minutes: 425
+    steps:
+      - uses: actions/checkout@v4
 
-    - uses: actions/setup-python@v5
-      with:
-        python-version: "3.12"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-    - name: Download auth from previous run
-      continue-on-error: true
-      uses: actions/download-artifact@v4
-      with:
-        name: auth-run1
-        path: .
+      - name: Download auth from previous run
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: auth-run1
+          path: .
 
-    - name: Run live.py (6h max, timeout = success)
-      shell: bash
-      run: |
-        pip install requests
-        timeout --signal=SIGTERM 21600 python live.py
-        STATUS=$?
-        if [ $STATUS -eq 124 ]; then
-          echo "6-hour timeout reached - exiting successfully"
-          exit 0
-        else
-          exit $STATUS
-        fi
+      - name: Run live.py (6h max, timeout = success)
+        shell: bash
+        run: |
+          pip install requests
+          timeout --signal=SIGTERM 21600 python live.py
+          STATUS=$?
+          if [ $STATUS -eq 124 ]; then
+            echo "6-hour timeout reached - exiting successfully"
+            exit 0
+          else
+            exit $STATUS
+          fi
 
-    - name: Upload auth artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: auth-run2
-        path: auth.txt
-        retention-days: 1
+      - name: Upload auth artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: auth-run2
+          path: auth.txt
+          retention-days: 1
 
-run3:
-  needs: run2
-  runs-on: ubuntu-latest
-  timeout-minutes: 425
-  steps:
-    - uses: actions/checkout@v4
+  run3:
+    needs: run2
+    runs-on: ubuntu-latest
+    timeout-minutes: 425
+    steps:
+      - uses: actions/checkout@v4
 
-    - uses: actions/setup-python@v5
-      with:
-        python-version: "3.12"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-    - name: Download auth from previous run
-      continue-on-error: true
-      uses: actions/download-artifact@v4
-      with:
-        name: auth-run2
-        path: .
+      - name: Download auth from previous run
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: auth-run2
+          path: .
 
-    - name: Run live.py (6h max, timeout = success)
-      shell: bash
-      run: |
-        pip install requests
-        timeout --signal=SIGTERM 21600 python live.py
-        STATUS=$?
-        if [ $STATUS -eq 124 ]; then
-          echo "6-hour timeout reached - exiting successfully"
-          exit 0
-        else
-          exit $STATUS
-        fi
+      - name: Run live.py (6h max, timeout = success)
+        shell: bash
+        run: |
+          pip install requests
+          timeout --signal=SIGTERM 21600 python live.py
+          STATUS=$?
+          if [ $STATUS -eq 124 ]; then
+            echo "6-hour timeout reached - exiting successfully"
+            exit 0
+          else
+            exit $STATUS
+          fi
 
-    - name: Upload auth artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: auth-run3
-        path: auth.txt
-        retention-days: 1
+      - name: Upload auth artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: auth-run3
+          path: auth.txt
+          retention-days: 1
 
-run4:
-  needs: run3
-  runs-on: ubuntu-latest
-  timeout-minutes: 425
-  steps:
-    - uses: actions/checkout@v4
+  run4:
+    needs: run3
+    runs-on: ubuntu-latest
+    timeout-minutes: 425
+    steps:
+      - uses: actions/checkout@v4
 
-    - uses: actions/setup-python@v5
-      with:
-        python-version: "3.12"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-    - name: Download auth from previous run
-      continue-on-error: true
-      uses: actions/download-artifact@v4
-      with:
-        name: auth-run3
-        path: .
+      - name: Download auth from previous run
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: auth-run3
+          path: .
 
-    - name: Run live.py (6h max, timeout = success)
-      shell: bash
-      run: |
-        pip install requests
-        timeout --signal=SIGTERM 21600 python live.py
-        STATUS=$?
-        if [ $STATUS -eq 124 ]; then
-          echo "6-hour timeout reached - exiting successfully"
-          exit 0
-        else
-          exit $STATUS
-        fi
+      - name: Run live.py (6h max, timeout = success)
+        shell: bash
+        run: |
+          pip install requests
+          timeout --signal=SIGTERM 21600 python live.py
+          STATUS=$?
+          if [ $STATUS -eq 124 ]; then
+            echo "6-hour timeout reached - exiting successfully"
+            exit 0
+          else
+            exit $STATUS
+          fi
 
-    - name: Upload auth artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: auth-run4
-        path: auth.txt
-        retention-days: 1
-    
+      - name: Upload auth artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: auth-run4
+          path: auth.txt
+          retention-days: 1
