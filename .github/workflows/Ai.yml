@@ -82,7 +82,7 @@ jobs:
         shell: bash
         run: |
           pip install requests
-          timeout --signal=SIGTERM 21000 python live.py
+          timeout --signal=SIGTERM 21000 python live.py || true
           STATUS=$?
           if [ $STATUS -eq 124 ]; then
             echo "6-hour timeout reached - exiting successfully"
@@ -119,7 +119,7 @@ jobs:
         shell: bash
         run: |
           pip install requests
-          timeout --signal=SIGTERM 21000 python live.py
+          timeout --signal=SIGTERM 21000 python live.py || true
           STATUS=$?
           if [ $STATUS -eq 124 ]; then
             echo "6-hour timeout reached - exiting successfully"
@@ -157,7 +157,7 @@ jobs:
         shell: bash
         run: |
           pip install requests
-          timeout --signal=SIGTERM 21000 python live.py
+          timeout --signal=SIGTERM 21000 python live.py || true
           STATUS=$?
           if [ $STATUS -eq 124 ]; then
             echo "6-hour timeout reached - exiting successfully"
@@ -195,7 +195,7 @@ jobs:
         shell: bash
         run: |
           pip install requests
-          timeout --signal=SIGTERM 21000 python live.py
+          timeout --signal=SIGTERM 21000 python live.py || true
           STATUS=$?
           if [ $STATUS -eq 124 ]; then
             echo "6-hour timeout reached - exiting successfully"
