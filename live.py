@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-
 import os
 import time
 import json
@@ -39,7 +38,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     stream=sys.stdout,
 )
-log = logging.getLogger("betway_draw_bot")
+log = logging.getLogger("betway_bot")
 
 # ---------- global state ----------
 latest_raw: Dict[str, Any] = {}
@@ -378,8 +377,8 @@ def post_bet(token: str, brand: str, payload: Dict[str, Any]) -> Tuple[bool, boo
 
 def bet_worker(event_id: int, match_name: str, wager_amount: int, pick: str = "draw") -> None:
     retries = 0
-    log.info("Thread for match %d (%s) – placing DRAW bet with stake %d NGN",
-             event_id, match_name, wager_amount)
+    log.info("Thread for match %d (%s) – placing %s bet with stake %d NGN",
+             event_id, match_name, pick.upper(), wager_amount)
 
     try:
         while retries <= MAX_RETRIES and not shutdown_event.is_set():
@@ -413,13 +412,13 @@ def bet_worker(event_id: int, match_name: str, wager_amount: int, pick: str = "d
                     first_resp = resp_data.get("betResponses", [{}])[0]
                     betslip = first_resp.get("betslipId")
                     booking = first_resp.get("bookingCode")
-                    log.info("✅ DRAW bet placed! Betslip: %s, Booking: %s  (match %s)",
-                             betslip, booking, match_name)
+                    log.info("✅ %s bet placed! Betslip: %s, Booking: %s  (match %s)",
+                             pick.upper(), betslip, booking, match_name)
                 except Exception:
-                    log.info("✅ DRAW bet placed! Response: %s", resp_data)
+                    log.info("✅ %s bet placed! Response: %s", pick.upper(), resp_data)
 
                 if ONE_TIME:
-                    log.info("One-time mode – stopping after this bet.")
+                    log.info("One‑time mode – stopping after this bet.")
                     shutdown_event.set()
                 break
 
@@ -450,8 +449,9 @@ def bet_worker(event_id: int, match_name: str, wager_amount: int, pick: str = "d
             placed_bets.add(event_id)
 
 def main() -> None:
-    log.info("Draw‑After‑Goal (goal AFTER timer) Bot starting. Wager = %d NGN, Timer = %d s. One-time = %s",
-             WAGER_AMOUNT, WINDOW_SECONDS, ONE_TIME)
+    global ONLY_DRAW  # new flag
+    log.info("Goal‑After‑Timer Bot starting. Wager = %d NGN, Timer = %d s. One‑time = %s, Only‑Draw = %s",
+             WAGER_AMOUNT, WINDOW_SECONDS, ONE_TIME, ONLY_DRAW)
 
     authenticate(force_login=False)
     fetcher_thread = threading.Thread(target=background_fetcher, daemon=True)
@@ -507,7 +507,7 @@ def main() -> None:
                             "phase": "timer",
                             "start_time": time.time(),
                             "baseline_home": home_score,
-                            "baseline_away": away_score,  # not used, just recorded
+                            "baseline_away": away_score,
                         }
                         log.info("⏱️  Started 50‑s timer for %s (score %d-%d)",
                                  match_name, home_score, away_score)
@@ -520,52 +520,58 @@ def main() -> None:
                             continue
                         else:
                             # timer expired → switch to monitoring phase
-                            log.info("⏰ Timer ended for %s – now watching for a goal that makes it a draw",
+                            log.info("⏰ Timer ended for %s – now watching for a goal",
                                      match_name)
                             state["phase"] = "monitor"
-                            # record the score at the moment the timer expires as the new baseline
                             state["post_timer_baseline_home"] = home_score
                             state["post_timer_baseline_away"] = away_score
                             continue
 
                     elif state["phase"] == "monitor":
-                        # post‑timer: check for a goal that results in a draw
                         baseline_home = state["post_timer_baseline_home"]
                         baseline_away = state["post_timer_baseline_away"]
                         if home_score == baseline_home and away_score == baseline_away:
                             # no goal yet – keep waiting
                             continue
 
-                        # a goal has occurred (score changed)
+                        # a goal has occurred
                         log.info("⚽ Goal detected AFTER timer! %s new score %d-%d",
                                  match_name, home_score, away_score)
 
+                        # determine the outcome to bet on
                         if home_score == away_score:
-                            # it's a draw → place bet
-                            with progress_lock:
-                                if eid in placed_bets or eid in betting_in_progress:
-                                    del window_state[eid]
-                                    continue
-                                betting_in_progress.add(eid)
-
-                            t = threading.Thread(target=bet_worker,
-                                                 args=(eid, match_name, WAGER_AMOUNT, "draw"),
-                                                 daemon=True)
-                            t.start()
-                            active_bet_threads.append(t)
-                            log.info("🚀 Draw bet dispatched for %s (score %d-%d)",
-                                     match_name, home_score, away_score)
-                            # mark as processed
-                            with progress_lock:
-                                placed_bets.add(eid)
-                            del window_state[eid]
+                            pick = "draw"
+                        elif home_score > away_score:
+                            pick = "home"
                         else:
-                            # goal but not a draw – stop monitoring this match
-                            log.info("❌ Goal after timer but not a draw (%d-%d) – no bet for %s",
+                            pick = "away"
+
+                        if ONLY_DRAW and pick != "draw":
+                            log.info("❌ Goal after timer but not a draw (%d-%d) – "
+                                     "no bet (only‑draw mode) for %s",
                                      home_score, away_score, match_name)
                             with progress_lock:
                                 placed_bets.add(eid)
                             del window_state[eid]
+                            continue
+
+                        # place the bet
+                        with progress_lock:
+                            if eid in placed_bets or eid in betting_in_progress:
+                                del window_state[eid]
+                                continue
+                            betting_in_progress.add(eid)
+
+                        t = threading.Thread(target=bet_worker,
+                                             args=(eid, match_name, WAGER_AMOUNT, pick),
+                                             daemon=True)
+                        t.start()
+                        active_bet_threads.append(t)
+                        log.info("🚀 %s bet dispatched for %s (score %d-%d)",
+                                 pick.upper(), match_name, home_score, away_score)
+                        with progress_lock:
+                            placed_bets.add(eid)
+                        del window_state[eid]
 
         active_bet_threads = [t for t in active_bet_threads if t.is_alive()]
         time.sleep(0.5)
@@ -575,12 +581,14 @@ def main() -> None:
         t.join(timeout=5)
     log.info("Bot stopped cleanly.")
 
+# ---------- global flags ----------
 ONE_TIME: bool = False
+ONLY_DRAW: bool = False   # NEW
 
 def parse_overrides() -> None:
-    global WAGER_AMOUNT, USERNAME, PASSWORD, ONE_TIME
+    global WAGER_AMOUNT, USERNAME, PASSWORD, ONE_TIME, ONLY_DRAW
     parser = argparse.ArgumentParser(
-        description="Betway GT League Draw‑After‑Goal Bot (goal AFTER timer)"
+        description="Betway GT League Goal‑After‑Timer Bot"
     )
     parser.add_argument("--wager", type=int, default=None,
                         help="Stake amount in NGN")
@@ -590,6 +598,8 @@ def parse_overrides() -> None:
                         help="Betway password")
     parser.add_argument("--one-time", action="store_true", default=False,
                         help="Stop after the first successful bet")
+    parser.add_argument("--only-draw", action="store_true", default=False,
+                        help="Only bet on draw outcomes (ignore home/away wins)")  # NEW
     args, _ = parser.parse_known_args()
 
     if args.wager is not None:
@@ -598,9 +608,10 @@ def parse_overrides() -> None:
         USERNAME = args.username
     if args.password is not None:
         PASSWORD = args.password
-    global ONE_TIME
     if args.one_time:
         ONE_TIME = True
+    if args.only_draw:         # NEW
+        ONLY_DRAW = True
 
 if __name__ == "__main__":
     parse_overrides()
