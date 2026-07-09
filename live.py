@@ -17,8 +17,8 @@ import requests
 # ---------- configuration ----------
 USERNAME: str = "08035796220"
 PASSWORD: str = "password"
-WAGER_AMOUNT: int = 102          # stake in NGN
-WINDOW_SECONDS: int = 50         # timer length after game time ≥ 11 min
+WAGER_AMOUNT: int = 103          # stake in NGN
+WINDOW_SECONDS: int = 53         # timer length after game time ≥ 11 min
 MAX_RETRIES: int = 3
 
 # ---------- API endpoints ----------
