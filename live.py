@@ -17,8 +17,8 @@ import requests
 # ---------- configuration ----------
 USERNAME: str = "08035796220"
 PASSWORD: str = "password"
-WAGER_AMOUNT: int = 103          # stake in NGN
-WINDOW_SECONDS: int = 53         # timer length after game time ≥ 11 min
+WAGER_AMOUNT: int = 102          # stake in NGN
+ODDS_THRESHOLD: float = 41.0     # bet opposite if odds >= this value
 MAX_RETRIES: int = 3
 
 # ---------- API endpoints ----------
@@ -38,7 +38,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     stream=sys.stdout,
 )
-log = logging.getLogger("betway_bot")
+log = logging.getLogger("betway_odds_bot")
 
 # ---------- global state ----------
 latest_raw: Dict[str, Any] = {}
@@ -54,10 +54,6 @@ betting_in_progress: set[int] = set()
 progress_lock = threading.Lock()
 
 shutdown_event = threading.Event()
-
-# window state for the two‑phase logic
-window_state: Dict[int, Dict[str, Any]] = {}
-window_lock = threading.Lock()
 
 AUTH_FILE = "auth.txt"
 
@@ -76,15 +72,6 @@ def decode_jwt(token: str) -> Dict[str, Any]:
         return json.loads(decoded)
     except Exception:
         return {}
-
-def get_score(game_state: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
-    score_list = game_state.get("score")
-    if isinstance(score_list, list) and len(score_list) >= 2:
-        try:
-            return int(score_list[0]), int(score_list[1])
-        except (ValueError, TypeError):
-            pass
-    return None, None
 
 def _is_hidden_error(error_text: str, data_obj: Optional[Dict[str, Any]] = None) -> bool:
     triggers = ["price", "version", "changed", "expired", "no longer available",
@@ -251,6 +238,7 @@ def background_fetcher() -> None:
             time.sleep(1)
 
 def build_selection(raw: Dict[str, Any], event_id: int, pick: str) -> Optional[Dict[str, Any]]:
+    """pick = 'home', 'away', or 'draw'"""
     events = {e["eventId"]: e for e in raw.get("events", [])}
     prices_map = {p["outcomeId"]: p for p in raw.get("prices", [])}
     outcomes_by_market: Dict[int, list] = {}
@@ -375,7 +363,7 @@ def post_bet(token: str, brand: str, payload: Dict[str, Any]) -> Tuple[bool, boo
         return False, False, None, str(e)
     return False, False, None, "Unknown error"
 
-def bet_worker(event_id: int, match_name: str, wager_amount: int, pick: str = "draw") -> None:
+def bet_worker(event_id: int, match_name: str, wager_amount: int, pick: str) -> None:
     retries = 0
     log.info("Thread for match %d (%s) – placing %s bet with stake %d NGN",
              event_id, match_name, pick.upper(), wager_amount)
@@ -416,10 +404,6 @@ def bet_worker(event_id: int, match_name: str, wager_amount: int, pick: str = "d
                              pick.upper(), betslip, booking, match_name)
                 except Exception:
                     log.info("✅ %s bet placed! Response: %s", pick.upper(), resp_data)
-
-                if ONE_TIME:
-                    log.info("One‑time mode – stopping after this bet.")
-                    shutdown_event.set()
                 break
 
             if hidden_error:
@@ -449,9 +433,8 @@ def bet_worker(event_id: int, match_name: str, wager_amount: int, pick: str = "d
             placed_bets.add(event_id)
 
 def main() -> None:
-    global ONLY_DRAW  # new flag
-    log.info("Goal‑After‑Timer Bot starting. Wager = %d NGN, Timer = %d s. One‑time = %s, Only‑Draw = %s",
-             WAGER_AMOUNT, WINDOW_SECONDS, ONE_TIME, ONLY_DRAW)
+    log.info("Odds Threshold Bot starting. Wager = %d NGN, Threshold = %.1f",
+             WAGER_AMOUNT, ODDS_THRESHOLD)
 
     authenticate(force_login=False)
     fetcher_thread = threading.Thread(target=background_fetcher, daemon=True)
@@ -463,115 +446,64 @@ def main() -> None:
         with data_lock:
             raw = dict(latest_raw)
 
-        gt_events = [
+        # target only GT League esoccer matches
+        target_events = [
             e for e in raw.get("events", [])
             if e.get("regionId") == "esoccer"
             and e.get("leagueId") == "gt-leagues"
             and e.get("isActive", False)
         ]
 
-        current_ids = {ev["eventId"] for ev in gt_events}
-
-        with window_lock:
-            # remove state for matches no longer present
-            for eid in list(window_state.keys()):
-                if eid not in current_ids:
-                    del window_state[eid]
-
-        for event in gt_events:
+        for event in target_events:
             eid = event["eventId"]
 
             with progress_lock:
                 if eid in placed_bets or eid in betting_in_progress:
                     continue
 
-            gs = event.get("gameStateTimeScore", {})
-            elapsed_min = gs.get("time")
-            if not isinstance(elapsed_min, (int, float)):
-                continue
-
-            home_score, away_score = get_score(gs)
-            if home_score is None or away_score is None:
-                continue
-
             match_name = f"{event['homeTeam']} vs {event['awayTeam']}"
 
-            # ----- Phase 1: start timer at game time >= 11 min -----
-            if elapsed_min >= 11:
-                with window_lock:
-                    state = window_state.get(eid)
+            # get home and away odds
+            home_sel = build_selection(raw, eid, "home")
+            away_sel = build_selection(raw, eid, "away")
 
-                    if state is None:
-                        # first time – create timer state, ignore score until timer expires
-                        window_state[eid] = {
-                            "phase": "timer",
-                            "start_time": time.time(),
-                            "baseline_home": home_score,
-                            "baseline_away": away_score,
-                        }
-                        log.info("⏱️  Started 50‑s timer for %s (score %d-%d)",
-                                 match_name, home_score, away_score)
-                        continue
+            home_odds = None
+            away_odds = None
+            try:
+                if home_sel:
+                    home_odds = float(home_sel["price"])
+                if away_sel:
+                    away_odds = float(away_sel["price"])
+            except (ValueError, TypeError):
+                continue
 
-                    if state["phase"] == "timer":
-                        elapsed_real = time.time() - state["start_time"]
-                        if elapsed_real < WINDOW_SECONDS:
-                            # still in timer – do nothing, just wait
-                            continue
-                        else:
-                            # timer expired → switch to monitoring phase
-                            log.info("⏰ Timer ended for %s – now watching for a goal",
-                                     match_name)
-                            state["phase"] = "monitor"
-                            state["post_timer_baseline_home"] = home_score
-                            state["post_timer_baseline_away"] = away_score
-                            continue
+            if home_odds is None or away_odds is None:
+                continue  # can't compare, skip
 
-                    elif state["phase"] == "monitor":
-                        baseline_home = state["post_timer_baseline_home"]
-                        baseline_away = state["post_timer_baseline_away"]
-                        if home_score == baseline_home and away_score == baseline_away:
-                            # no goal yet – keep waiting
-                            continue
+            # decide bet
+            pick = None
+            if home_odds >= ODDS_THRESHOLD:
+                pick = "away"
+                reason = f"home odds {home_odds:.2f} >= {ODDS_THRESHOLD}"
+            elif away_odds >= ODDS_THRESHOLD:
+                pick = "home"
+                reason = f"away odds {away_odds:.2f} >= {ODDS_THRESHOLD}"
 
-                        # a goal has occurred
-                        log.info("⚽ Goal detected AFTER timer! %s new score %d-%d",
-                                 match_name, home_score, away_score)
+            if pick is None:
+                continue
 
-                        # determine the outcome to bet on
-                        if home_score == away_score:
-                            pick = "draw"
-                        elif home_score > away_score:
-                            pick = "home"
-                        else:
-                            pick = "away"
+            # place bet in background thread
+            with progress_lock:
+                if eid in placed_bets or eid in betting_in_progress:
+                    continue
+                betting_in_progress.add(eid)
 
-                        if ONLY_DRAW and pick != "draw":
-                            log.info("❌ Goal after timer but not a draw (%d-%d) – "
-                                     "no bet (only‑draw mode) for %s",
-                                     home_score, away_score, match_name)
-                            with progress_lock:
-                                placed_bets.add(eid)
-                            del window_state[eid]
-                            continue
-
-                        # place the bet
-                        with progress_lock:
-                            if eid in placed_bets or eid in betting_in_progress:
-                                del window_state[eid]
-                                continue
-                            betting_in_progress.add(eid)
-
-                        t = threading.Thread(target=bet_worker,
-                                             args=(eid, match_name, WAGER_AMOUNT, pick),
-                                             daemon=True)
-                        t.start()
-                        active_bet_threads.append(t)
-                        log.info("🚀 %s bet dispatched for %s (score %d-%d)",
-                                 pick.upper(), match_name, home_score, away_score)
-                        with progress_lock:
-                            placed_bets.add(eid)
-                        del window_state[eid]
+            log.info("🎯 Betting %s on %s because %s", pick.upper(), match_name, reason)
+            t = threading.Thread(target=bet_worker,
+                                 args=(eid, match_name, WAGER_AMOUNT, pick),
+                                 daemon=True)
+            t.start()
+            active_bet_threads.append(t)
 
         active_bet_threads = [t for t in active_bet_threads if t.is_alive()]
         time.sleep(0.5)
@@ -581,14 +513,10 @@ def main() -> None:
         t.join(timeout=5)
     log.info("Bot stopped cleanly.")
 
-# ---------- global flags ----------
-ONE_TIME: bool = False
-ONLY_DRAW: bool = False   # NEW
-
 def parse_overrides() -> None:
-    global WAGER_AMOUNT, USERNAME, PASSWORD, ONE_TIME, ONLY_DRAW
+    global WAGER_AMOUNT, USERNAME, PASSWORD, ODDS_THRESHOLD
     parser = argparse.ArgumentParser(
-        description="Betway GT League Goal‑After‑Timer Bot"
+        description="Betway GT League Odds Threshold Bot – bet opposite when odds >= threshold"
     )
     parser.add_argument("--wager", type=int, default=None,
                         help="Stake amount in NGN")
@@ -596,10 +524,8 @@ def parse_overrides() -> None:
                         help="Betway username")
     parser.add_argument("--password", type=str, default=None,
                         help="Betway password")
-    parser.add_argument("--one-time", action="store_true", default=False,
-                        help="Stop after the first successful bet")
-    parser.add_argument("--only-draw", action="store_true", default=False,
-                        help="Only bet on draw outcomes (ignore home/away wins)")  # NEW
+    parser.add_argument("--threshold", type=float, default=ODDS_THRESHOLD,
+                        help=f"Odds threshold (default {ODDS_THRESHOLD})")
     args, _ = parser.parse_known_args()
 
     if args.wager is not None:
@@ -608,10 +534,8 @@ def parse_overrides() -> None:
         USERNAME = args.username
     if args.password is not None:
         PASSWORD = args.password
-    if args.one_time:
-        ONE_TIME = True
-    if args.only_draw:         # NEW
-        ONLY_DRAW = True
+    if args.threshold is not None:
+        ODDS_THRESHOLD = args.threshold
 
 if __name__ == "__main__":
     parse_overrides()
