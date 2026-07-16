@@ -15,10 +15,9 @@ from typing import Dict, Optional, Any, Tuple, List
 import requests
 
 # ---------- configuration ----------
-USERNAME: str = "08035796220"
-PASSWORD: str = "password"
-WAGER_AMOUNT: int = 102          # stake in NGN
-ODDS_THRESHOLD: float = 41.0     # bet opposite if odds >= this value
+USERNAME: str = "08109995000"
+PASSWORD: str = "passwords"
+WAGER_AMOUNT: int = 100          # stake in NGN
 MAX_RETRIES: int = 3
 
 # ---------- API endpoints ----------
@@ -38,7 +37,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     stream=sys.stdout,
 )
-log = logging.getLogger("betway_odds_bot")
+log = logging.getLogger("betway_bot")
 
 # ---------- global state ----------
 latest_raw: Dict[str, Any] = {}
@@ -72,6 +71,15 @@ def decode_jwt(token: str) -> Dict[str, Any]:
         return json.loads(decoded)
     except Exception:
         return {}
+
+def get_score(game_state: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+    score_list = game_state.get("score")
+    if isinstance(score_list, list) and len(score_list) >= 2:
+        try:
+            return int(score_list[0]), int(score_list[1])
+        except (ValueError, TypeError):
+            pass
+    return None, None
 
 def _is_hidden_error(error_text: str, data_obj: Optional[Dict[str, Any]] = None) -> bool:
     triggers = ["price", "version", "changed", "expired", "no longer available",
@@ -238,7 +246,6 @@ def background_fetcher() -> None:
             time.sleep(1)
 
 def build_selection(raw: Dict[str, Any], event_id: int, pick: str) -> Optional[Dict[str, Any]]:
-    """pick = 'home', 'away', or 'draw'"""
     events = {e["eventId"]: e for e in raw.get("events", [])}
     prices_map = {p["outcomeId"]: p for p in raw.get("prices", [])}
     outcomes_by_market: Dict[int, list] = {}
@@ -363,7 +370,7 @@ def post_bet(token: str, brand: str, payload: Dict[str, Any]) -> Tuple[bool, boo
         return False, False, None, str(e)
     return False, False, None, "Unknown error"
 
-def bet_worker(event_id: int, match_name: str, wager_amount: int, pick: str) -> None:
+def bet_worker(event_id: int, match_name: str, wager_amount: int, pick: str = "draw") -> None:
     retries = 0
     log.info("Thread for match %d (%s) – placing %s bet with stake %d NGN",
              event_id, match_name, pick.upper(), wager_amount)
@@ -404,6 +411,10 @@ def bet_worker(event_id: int, match_name: str, wager_amount: int, pick: str) -> 
                              pick.upper(), betslip, booking, match_name)
                 except Exception:
                     log.info("✅ %s bet placed! Response: %s", pick.upper(), resp_data)
+
+                if ONE_TIME:
+                    log.info("One‑time mode – stopping after this bet.")
+                    shutdown_event.set()
                 break
 
             if hidden_error:
@@ -433,8 +444,9 @@ def bet_worker(event_id: int, match_name: str, wager_amount: int, pick: str) -> 
             placed_bets.add(event_id)
 
 def main() -> None:
-    log.info("Odds Threshold Bot starting. Wager = %d NGN, Threshold = %.1f",
-             WAGER_AMOUNT, ODDS_THRESHOLD)
+    log.info("Odds-based Bot starting. Wager = %d NGN. "
+             "Condition: game ≥ 11 min, odds in [1.50, 2.00). One‑time = %s",
+             WAGER_AMOUNT, ONE_TIME)
 
     authenticate(force_login=False)
     fetcher_thread = threading.Thread(target=background_fetcher, daemon=True)
@@ -446,64 +458,65 @@ def main() -> None:
         with data_lock:
             raw = dict(latest_raw)
 
-        # target only GT League esoccer matches
-        target_events = [
+        gt_events = [
             e for e in raw.get("events", [])
             if e.get("regionId") == "esoccer"
             and e.get("leagueId") == "gt-leagues"
             and e.get("isActive", False)
         ]
 
-        for event in target_events:
+        for event in gt_events:
             eid = event["eventId"]
 
             with progress_lock:
                 if eid in placed_bets or eid in betting_in_progress:
                     continue
 
+            gs = event.get("gameStateTimeScore", {})
+            elapsed_min = gs.get("time")
+            if not isinstance(elapsed_min, (int, float)):
+                continue
+
+            home_score, away_score = get_score(gs)
+            if home_score is None or away_score is None:
+                continue
+
             match_name = f"{event['homeTeam']} vs {event['awayTeam']}"
 
-            # get home and away odds
-            home_sel = build_selection(raw, eid, "home")
-            away_sel = build_selection(raw, eid, "away")
+            # --- Check the new condition ---
+            if elapsed_min >= 11:
+                home_sel = build_selection(raw, eid, "home")
+                draw_sel = build_selection(raw, eid, "draw")
+                away_sel = build_selection(raw, eid, "away")
 
-            home_odds = None
-            away_odds = None
-            try:
-                if home_sel:
-                    home_odds = float(home_sel["price"])
-                if away_sel:
-                    away_odds = float(away_sel["price"])
-            except (ValueError, TypeError):
-                continue
+                candidates = []
+                for pick, sel in [("home", home_sel), ("draw", draw_sel), ("away", away_sel)]:
+                    if sel and sel.get("price"):
+                        try:
+                            price = float(sel["price"])
+                        except (ValueError, TypeError):
+                            continue
+                        if 1.5 <= price < 2.0:
+                            candidates.append((price, pick))
 
-            if home_odds is None or away_odds is None:
-                continue  # can't compare, skip
+                if candidates:
+                    # pick the outcome with the highest odds
+                    best_price, best_pick = max(candidates, key=lambda x: x[0])
+                    log.info("🎯 Condition met for %s: %s @ %.2f (score %d-%d)",
+                             match_name, best_pick.upper(), best_price, home_score, away_score)
 
-            # decide bet
-            pick = None
-            if home_odds >= ODDS_THRESHOLD:
-                pick = "away"
-                reason = f"home odds {home_odds:.2f} >= {ODDS_THRESHOLD}"
-            elif away_odds >= ODDS_THRESHOLD:
-                pick = "home"
-                reason = f"away odds {away_odds:.2f} >= {ODDS_THRESHOLD}"
+                    with progress_lock:
+                        if eid in placed_bets or eid in betting_in_progress:
+                            continue
+                        betting_in_progress.add(eid)
 
-            if pick is None:
-                continue
-
-            # place bet in background thread
-            with progress_lock:
-                if eid in placed_bets or eid in betting_in_progress:
-                    continue
-                betting_in_progress.add(eid)
-
-            log.info("🎯 Betting %s on %s because %s", pick.upper(), match_name, reason)
-            t = threading.Thread(target=bet_worker,
-                                 args=(eid, match_name, WAGER_AMOUNT, pick),
-                                 daemon=True)
-            t.start()
-            active_bet_threads.append(t)
+                    t = threading.Thread(
+                        target=bet_worker,
+                        args=(eid, match_name, WAGER_AMOUNT, best_pick),
+                        daemon=True
+                    )
+                    t.start()
+                    active_bet_threads.append(t)
 
         active_bet_threads = [t for t in active_bet_threads if t.is_alive()]
         time.sleep(0.5)
@@ -513,10 +526,13 @@ def main() -> None:
         t.join(timeout=5)
     log.info("Bot stopped cleanly.")
 
+# ---------- global flags ----------
+ONE_TIME: bool = False
+
 def parse_overrides() -> None:
-    global WAGER_AMOUNT, USERNAME, PASSWORD, ODDS_THRESHOLD
+    global WAGER_AMOUNT, USERNAME, PASSWORD, ONE_TIME
     parser = argparse.ArgumentParser(
-        description="Betway GT League Odds Threshold Bot – bet opposite when odds >= threshold"
+        description="Betway GT League Odds‑Based Bot"
     )
     parser.add_argument("--wager", type=int, default=None,
                         help="Stake amount in NGN")
@@ -524,8 +540,8 @@ def parse_overrides() -> None:
                         help="Betway username")
     parser.add_argument("--password", type=str, default=None,
                         help="Betway password")
-    parser.add_argument("--threshold", type=float, default=ODDS_THRESHOLD,
-                        help=f"Odds threshold (default {ODDS_THRESHOLD})")
+    parser.add_argument("--one-time", action="store_true", default=False,
+                        help="Stop after the first successful bet")
     args, _ = parser.parse_known_args()
 
     if args.wager is not None:
@@ -534,8 +550,8 @@ def parse_overrides() -> None:
         USERNAME = args.username
     if args.password is not None:
         PASSWORD = args.password
-    if args.threshold is not None:
-        ODDS_THRESHOLD = args.threshold
+    if args.one_time:
+        ONE_TIME = True
 
 if __name__ == "__main__":
     parse_overrides()
