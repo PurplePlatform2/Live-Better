@@ -496,7 +496,7 @@ def main() -> None:
                             price = float(sel["price"])
                         except (ValueError, TypeError):
                             continue
-                        if 1.5 <= price < 2.0:
+                        if 1.0 <= price < 1.9:
                             candidates.append((price, pick))
 
                 if candidates:
