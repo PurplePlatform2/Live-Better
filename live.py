@@ -484,13 +484,11 @@ def main() -> None:
             match_name = f"{event['homeTeam']} vs {event['awayTeam']}"
 
             # --- Check the new condition ---
-            if elapsed_min >= 11:
-                home_sel = build_selection(raw, eid, "home")
+            if elapsed_min >= 11:                
                 draw_sel = build_selection(raw, eid, "draw")
-                away_sel = build_selection(raw, eid, "away")
 
                 candidates = []
-                for pick, sel in [("home", home_sel), ("draw", draw_sel), ("away", away_sel)]:
+                for pick, sel in [("home", 0), ("draw", draw_sel), ("away", 0)]:
                     if sel and sel.get("price"):
                         try:
                             price = float(sel["price"])
